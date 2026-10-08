@@ -1,8 +1,9 @@
-pyrogram
-tgcrypto
+pyrogram==2.0.106
+tgcrypto==1.2.5
 requests
 yt-dlp
 google-generativeai
 python-dotenv
 cloudscraper
 curl_cffi
+playwright
