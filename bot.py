@@ -42,7 +42,7 @@ else:
 DOWNLOAD_DIR = "./downloads/"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Thumbnails / images extensions jo SKIP karne hain
+# Extensions / keywords
 IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.ico', '.bmp']
 VIDEO_EXTS = ['.mp4', '.m3u8', '.webm', '.mkv', '.ts', '.mov', '.avi']
 BAD_KEYWORDS = ['preview', 'thumb', 'poster', 'sprite', 'trailer', 'placeholder', 'banner']
@@ -62,13 +62,11 @@ def humanbytes(size):
 
 
 def is_image_url(url: str) -> bool:
-    """Check agar URL image hai."""
     path = url.lower().split("?")[0]
     return any(ext in path for ext in IMAGE_EXTS)
 
 
 def is_video_url(url: str) -> bool:
-    """Check agar URL video hai."""
     path = url.lower().split("?")[0]
     return (
         any(ext in path for ext in VIDEO_EXTS)
@@ -85,13 +83,14 @@ def has_bad_keyword(url: str) -> bool:
 
 
 def make_absolute(url: str, base: str) -> str:
-    """Relative URL ko absolute banata hai."""
     if not url:
         return url
     if url.startswith("http://") or url.startswith("https://"):
         return url
     if url.startswith("//"):
         return "https:" + url
+    if not base:
+        return url
     if url.startswith("/"):
         return base.rstrip("/") + url
     return base.rstrip("/") + "/" + url
@@ -123,15 +122,15 @@ async def progress_status(current, total, status_msg, action_text, start_time):
 
 
 # ==========================================
-# 3. PLAYWRIGHT - STRICT VIDEO URL EXTRACTION
+# 3. PLAYWRIGHT - STRICT VIDEO URL EXTRACTION (NO LOOP)
 # ==========================================
 async def extract_video_url_via_browser(page_url: str) -> str:
     """
     Browser kholta hai, download button/href se SIRF real VIDEO URL nikalta hai.
-    Thumbnails, images, chhoti files sab SKIP karta hai.
-    Relative URLs ko absolute banata hai.
+    Pehla 1080p mil gaya to TURANT return karta hai — no loop.
     """
-    captured_urls = []   # (score, url) tuples
+    captured_urls = []   # (score, url)
+    seen_urls = set()    # Deduplication
     base_url = None
 
     try:
@@ -156,10 +155,14 @@ async def extract_video_url_via_browser(page_url: str) -> str:
             )
             page = await context.new_page()
 
-            # ---------- NETWORK MONITOR (STRICT) ----------
+            # ---------- NETWORK MONITOR (WITH DEDUP) ----------
             async def handle_response(response):
                 try:
                     url = response.url
+                    if url in seen_urls:
+                        return
+                    seen_urls.add(url)
+
                     req = response.request
                     rtype = req.resource_type
                     headers = response.headers
@@ -169,19 +172,13 @@ async def extract_video_url_via_browser(page_url: str) -> str:
                     except Exception:
                         clen = 0
 
-                    # ❌ IMAGE / THUMBNAIL SKIP
                     if ctype.startswith("image/"):
                         return
-                    if is_image_url(url):
+                    if is_image_url(url) or has_bad_keyword(url):
                         return
-                    if has_bad_keyword(url):
-                        return
-
-                    # ❌ Chhoti files (icons, sprites) skip
                     if 0 < clen < 500 * 1024:
                         return
 
-                    # ✅ Video detection
                     path = url.lower().split("?")[0]
                     is_vid = (
                         ctype.startswith("video/")
@@ -191,7 +188,6 @@ async def extract_video_url_via_browser(page_url: str) -> str:
                     if not is_vid:
                         return
 
-                    # ✅ SCORE calculate
                     score = 0
                     if '1080' in path: score += 100
                     elif '720' in path: score += 80
@@ -216,7 +212,6 @@ async def extract_video_url_via_browser(page_url: str) -> str:
             except Exception as e:
                 logging.warning(f"[Playwright] goto warning: {e}")
 
-            # Base URL nikalo
             try:
                 base_url = await page.evaluate("() => location.origin")
                 logging.info(f"[Playwright] Base origin: {base_url}")
@@ -224,9 +219,9 @@ async def extract_video_url_via_browser(page_url: str) -> str:
                 parsed = urlparse(page_url)
                 base_url = f"{parsed.scheme}://{parsed.netloc}"
 
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(3000)
 
-            # ---------- DOWNLOAD BUTTON / HREF EXTRACTION ----------
+            # ---------- HREF EXTRACTION (NO CLICK) ----------
             download_selectors = [
                 'a[href*="1080"]',
                 'a[href*="720"]',
@@ -234,12 +229,9 @@ async def extract_video_url_via_browser(page_url: str) -> str:
                 'a[href*=".mp4"]',
                 'a[href*=".m3u8"]',
                 'a[href*="download"]',
-                'a:has-text("MP4")',
                 'a:has-text("1080p")',
-                'a:has-text("720p")',
+                'a:has-text("MP4")',
                 'a:has-text("Download")',
-                'button:has-text("Download")',
-                'a:has-text("DOWNLOAD")',
                 'a[download]',
                 '.download-button',
                 '.btn-download',
@@ -253,53 +245,91 @@ async def extract_video_url_via_browser(page_url: str) -> str:
                     for el in elements:
                         try:
                             href = await el.get_attribute("href")
-                            if href:
-                                abs_url = make_absolute(href, base_url)
-                                # Skip images & bad URLs
-                                if is_image_url(abs_url) or has_bad_keyword(abs_url):
-                                    continue
-                                if is_video_url(abs_url) or 'get_file' in abs_url.lower():
-                                    score = 250
-                                    if '1080' in abs_url: score += 50
-                                    elif '720' in abs_url: score += 30
-                                    captured_urls.append((score, abs_url))
-                                    logging.info(f"[HREF] 🎯 {abs_url}")
+                            if not href:
+                                continue
 
-                            # Try clicking (download event)
-                            try:
-                                async with page.expect_download(timeout=4000) as dl_info:
-                                    await el.click()
-                                download = await dl_info.value
-                                if download.url and not is_image_url(download.url):
-                                    captured_urls.append((400, download.url))
-                                    logging.info(f"[DL-EVENT] 🎯 {download.url}")
-                            except Exception:
-                                pass
+                            abs_url = make_absolute(href, base_url)
+                            if is_image_url(abs_url) or has_bad_keyword(abs_url):
+                                continue
+                            if not (is_video_url(abs_url) or 'get_file' in abs_url.lower()):
+                                continue
+                            if abs_url in seen_urls:
+                                continue
+                            seen_urls.add(abs_url)
+
+                            score = 250
+                            if '1080' in abs_url: score += 100
+                            elif '720' in abs_url: score += 50
+                            elif '480' in abs_url: score += 20
+                            captured_urls.append((score, abs_url))
+                            logging.info(f"[HREF] 🎯 score={score} {abs_url[:130]}")
                         except Exception:
                             continue
                 except Exception:
                     continue
 
-            # ---------- DOM EVAL FALLBACK ----------
+            # ✅ 1080p mil gaya? Turant return karo
+            best_1080 = [u for s, u in captured_urls if '1080' in u.lower()]
+            if best_1080:
+                logging.info("[Playwright] ✅ 1080p HREF mil gaya, browser band kar raha hoon")
+                await browser.close()
+                return best_1080[0]
+
+            # ---------- CLICK ONLY IF NO HREF ----------
+            if not captured_urls:
+                logging.info("[Playwright] HREF nahi mila, click try kar raha hoon...")
+                click_selectors = [
+                    'a:has-text("1080p")',
+                    'a:has-text("Download")',
+                    'button:has-text("Download")',
+                    'a[download]',
+                    '.download-button',
+                ]
+                clicked = False
+                for selector in click_selectors:
+                    if clicked:
+                        break
+                    try:
+                        el = await page.query_selector(selector)
+                        if not el:
+                            continue
+                        try:
+                            async with page.expect_download(timeout=3000) as dl_info:
+                                await el.click()
+                            dl = await dl_info.value
+                            if dl.url and not is_image_url(dl.url):
+                                captured_urls.append((500, dl.url))
+                                logging.info(f"[DL-EVENT] 🎯 {dl.url}")
+                                clicked = True
+                        except Exception:
+                            try:
+                                await el.click()
+                            except Exception:
+                                pass
+                            await page.wait_for_timeout(2000)
+                            if captured_urls:
+                                clicked = True
+                    except Exception:
+                        continue
+
+            # ---------- DOM FALLBACK ----------
             if not captured_urls:
                 try:
                     dom_urls = await page.evaluate("""
                         () => {
-                            const results = [];
+                            const r = [];
                             document.querySelectorAll('video').forEach(v => {
-                                if (v.src) results.push(v.src);
-                                if (v.currentSrc) results.push(v.currentSrc);
+                                if (v.src) r.push(v.src);
+                                if (v.currentSrc) r.push(v.currentSrc);
                             });
                             document.querySelectorAll('video source').forEach(s => {
-                                if (s.src) results.push(s.src);
+                                if (s.src) r.push(s.src);
                             });
                             document.querySelectorAll('a').forEach(a => {
                                 const h = a.href || '';
-                                if (h.match(/\\.(mp4|m3u8|webm|mkv)/i) || h.includes('get_file') || h.includes('get_video')) {
-                                    results.push(h);
-                                }
+                                if (h.match(/\\.(mp4|m3u8|webm|mkv)/i) || h.includes('get_file')) r.push(h);
                             });
-                            return results;
+                            return [...new Set(r)];
                         }
                     """)
                     for vs in (dom_urls or []):
@@ -308,10 +338,13 @@ async def extract_video_url_via_browser(page_url: str) -> str:
                         abs_u = make_absolute(vs, base_url)
                         if is_image_url(abs_u) or has_bad_keyword(abs_u):
                             continue
+                        if abs_u in seen_urls:
+                            continue
+                        seen_urls.add(abs_u)
                         if is_video_url(abs_u):
                             score = 150 if '1080' in abs_u else 100
                             captured_urls.append((score, abs_u))
-                            logging.info(f"[DOM] 🎯 {abs_u}")
+                            logging.info(f"[DOM] 🎯 {abs_u[:130]}")
                 except Exception as e:
                     logging.debug(f"DOM eval err: {e}")
 
@@ -328,13 +361,11 @@ async def extract_video_url_via_browser(page_url: str) -> str:
     captured_urls.sort(reverse=True, key=lambda x: x[0])
     best = captured_urls[0][1]
 
-    # Final safety: absolute banao
     if base_url and not best.startswith("http"):
         best = make_absolute(best, base_url)
 
-    # Final image check
     if is_image_url(best):
-        logging.error(f"[Playwright] ❌ Best URL image hai, skip: {best}")
+        logging.error(f"[Playwright] ❌ Best URL image hai: {best}")
         return None
 
     logging.info(f"[Playwright] ✅ FINAL URL: {best}")
@@ -366,7 +397,6 @@ def download_direct(url, output_path):
         browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
     )
 
-    # Load cookies.txt if exists
     if os.path.exists('cookies.txt'):
         try:
             cj = http.cookiejar.MozillaCookieJar('cookies.txt')
@@ -379,13 +409,11 @@ def download_direct(url, output_path):
     response = scraper.get(url, headers=headers, stream=True, timeout=120, allow_redirects=True)
     response.raise_for_status()
 
-    # ❌ Content-Type check
     ctype = response.headers.get("content-type", "").lower()
     if ctype.startswith("image/"):
         raise Exception(f"❌ Ye thumbnail/image hai, video nahi! (Content-Type: {ctype})")
-
     if "text/html" in ctype:
-        raise Exception(f"❌ HTML mila, video nahi (login/redirect issue). Content-Type: {ctype}")
+        raise Exception(f"❌ HTML mila, video nahi. Content-Type: {ctype}")
 
     total = int(response.headers.get("content-length", 0) or 0)
     downloaded = 0
@@ -396,7 +424,6 @@ def download_direct(url, output_path):
                 f.write(chunk)
                 downloaded += len(chunk)
 
-    # ❌ Chhoti file check (thumbnail lagti hai)
     if downloaded < 500 * 1024:
         try:
             os.remove(output_path)
