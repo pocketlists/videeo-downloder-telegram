@@ -1,0 +1,6 @@
+pyrogram
+tgcrypto
+requests
+yt-dlp
+google-generativeai
+python-dotenv
