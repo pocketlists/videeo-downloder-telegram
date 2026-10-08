@@ -2,7 +2,7 @@ name: Run Telegram Video Downloader Bot
 
 on:
   schedule:
-    - cron: '0 */5 * * *'   # Har 5 ghante auto-restart
+    - cron: '0 */5 * * *'
   workflow_dispatch:
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install System Dependencies (FFmpeg + Playwright deps)
+      - name: Install System Dependencies (FFmpeg)
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
@@ -30,7 +30,7 @@ jobs:
           pip install -r requirements.txt
           pip install --upgrade yt-dlp
 
-      - name: Install Playwright Chromium Browser
+      - name: Install Playwright Chromium
         run: |
           python -m playwright install chromium
           python -m playwright install-deps chromium
