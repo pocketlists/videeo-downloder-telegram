@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 import logging
+import http.cookiejar
 from urllib.parse import urlparse
 import yt_dlp
 import cloudscraper
@@ -11,7 +12,7 @@ from playwright.async_api import async_playwright
 import google.generativeai as genai
 
 # ==========================================
-# 1. ENVIRONMENT VARIABLES (GITHUB SECRETS)
+# 1. ENVIRONMENT VARIABLES
 # ==========================================
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
@@ -41,6 +42,11 @@ else:
 DOWNLOAD_DIR = "./downloads/"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# Thumbnails / images extensions jo SKIP karne hain
+IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.ico', '.bmp']
+VIDEO_EXTS = ['.mp4', '.m3u8', '.webm', '.mkv', '.ts', '.mov', '.avi']
+BAD_KEYWORDS = ['preview', 'thumb', 'poster', 'sprite', 'trailer', 'placeholder', 'banner']
+
 
 # ==========================================
 # 2. HELPER FUNCTIONS
@@ -55,6 +61,42 @@ def humanbytes(size):
     return f"{size:.2f} TB"
 
 
+def is_image_url(url: str) -> bool:
+    """Check agar URL image hai."""
+    path = url.lower().split("?")[0]
+    return any(ext in path for ext in IMAGE_EXTS)
+
+
+def is_video_url(url: str) -> bool:
+    """Check agar URL video hai."""
+    path = url.lower().split("?")[0]
+    return (
+        any(ext in path for ext in VIDEO_EXTS)
+        or "/get_file/" in path
+        or "/get_video/" in path
+        or "videoplayback" in path
+        or "/download/" in path
+    )
+
+
+def has_bad_keyword(url: str) -> bool:
+    path = url.lower()
+    return any(bad in path for bad in BAD_KEYWORDS)
+
+
+def make_absolute(url: str, base: str) -> str:
+    """Relative URL ko absolute banata hai."""
+    if not url:
+        return url
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("/"):
+        return base.rstrip("/") + url
+    return base.rstrip("/") + "/" + url
+
+
 async def progress_status(current, total, status_msg, action_text, start_time):
     now = time.time()
     diff = now - start_time
@@ -66,7 +108,7 @@ async def progress_status(current, total, status_msg, action_text, start_time):
 
     if now - progress_status.last_update > 3 or current == total:
         progress_status.last_update = now
-        percentage = (current / total) * 100
+        percentage = (current / total) * 100 if total else 0
         speed = current / diff
         text = (
             f"⏳ **{action_text}...**\n"
@@ -81,14 +123,16 @@ async def progress_status(current, total, status_msg, action_text, start_time):
 
 
 # ==========================================
-# 3. PLAYWRIGHT - DOWNLOAD BUTTON CLICK KARKE LINK NIKALNA
+# 3. PLAYWRIGHT - STRICT VIDEO URL EXTRACTION
 # ==========================================
 async def extract_video_url_via_browser(page_url: str) -> str:
     """
-    Browser kholta hai, download button dhundh ke click karta hai,
-    aur direct video URL capture karta hai (network monitoring se bhi).
+    Browser kholta hai, download button/href se SIRF real VIDEO URL nikalta hai.
+    Thumbnails, images, chhoti files sab SKIP karta hai.
+    Relative URLs ko absolute banata hai.
     """
-    captured_url = None
+    captured_urls = []   # (score, url) tuples
+    base_url = None
 
     try:
         async with async_playwright() as p:
@@ -112,122 +156,196 @@ async def extract_video_url_via_browser(page_url: str) -> str:
             )
             page = await context.new_page()
 
-            # ---- Network monitor: video URLs capture karo ----
+            # ---------- NETWORK MONITOR (STRICT) ----------
             async def handle_response(response):
-                nonlocal captured_url
                 try:
                     url = response.url
-                    content_type = response.headers.get("content-type", "")
-                    if any(ext in url.lower() for ext in ['.mp4', '.m3u8', '.webm', '.mkv']):
-                        if not captured_url:
-                            captured_url = url
-                            logging.info(f"[Playwright] Network captured: {url}")
-                    elif "video" in content_type and "html" not in content_type:
-                        if not captured_url:
-                            captured_url = url
-                            logging.info(f"[Playwright] Content-type video: {url}")
-                except Exception:
-                    pass
+                    req = response.request
+                    rtype = req.resource_type
+                    headers = response.headers
+                    ctype = headers.get("content-type", "").lower()
+                    try:
+                        clen = int(headers.get("content-length", 0) or 0)
+                    except Exception:
+                        clen = 0
+
+                    # ❌ IMAGE / THUMBNAIL SKIP
+                    if ctype.startswith("image/"):
+                        return
+                    if is_image_url(url):
+                        return
+                    if has_bad_keyword(url):
+                        return
+
+                    # ❌ Chhoti files (icons, sprites) skip
+                    if 0 < clen < 500 * 1024:
+                        return
+
+                    # ✅ Video detection
+                    path = url.lower().split("?")[0]
+                    is_vid = (
+                        ctype.startswith("video/")
+                        or ctype in ("application/octet-stream", "application/x-mpegurl", "application/vnd.apple.mpegurl")
+                        or is_video_url(url)
+                    )
+                    if not is_vid:
+                        return
+
+                    # ✅ SCORE calculate
+                    score = 0
+                    if '1080' in path: score += 100
+                    elif '720' in path: score += 80
+                    elif '480' in path: score += 60
+                    elif '360' in path: score += 40
+                    if rtype == "media": score += 30
+                    if ctype.startswith("video/"): score += 50
+                    if clen > 5 * 1024 * 1024: score += 60
+                    elif clen > 1 * 1024 * 1024: score += 30
+                    if '/get_file/' in path: score += 20
+
+                    captured_urls.append((score, url))
+                    logging.info(f"[NET] 🎬 candidate (score={score}, size={clen}): {url[:140]}")
+                except Exception as e:
+                    logging.debug(f"Response handler err: {e}")
 
             page.on("response", handle_response)
 
             logging.info(f"[Playwright] Opening: {page_url}")
-            await page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                await page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                logging.warning(f"[Playwright] goto warning: {e}")
+
+            # Base URL nikalo
+            try:
+                base_url = await page.evaluate("() => location.origin")
+                logging.info(f"[Playwright] Base origin: {base_url}")
+            except Exception:
+                parsed = urlparse(page_url)
+                base_url = f"{parsed.scheme}://{parsed.netloc}"
+
             await page.wait_for_timeout(4000)
 
-            # ---- Popups / new tabs handle karo ----
-            try:
-                pages = context.pages
-                if len(pages) > 1:
-                    page = pages[-1]
-            except Exception:
-                pass
-
-            # ---- Download button selectors ----
+            # ---------- DOWNLOAD BUTTON / HREF EXTRACTION ----------
             download_selectors = [
-                'a[href*="download"]',
+                'a[href*="1080"]',
+                'a[href*="720"]',
+                'a[href*="get_file"]',
                 'a[href*=".mp4"]',
                 'a[href*=".m3u8"]',
+                'a[href*="download"]',
+                'a:has-text("MP4")',
+                'a:has-text("1080p")',
+                'a:has-text("720p")',
                 'a:has-text("Download")',
                 'button:has-text("Download")',
-                'a:has-text("Download Video")',
                 'a:has-text("DOWNLOAD")',
                 'a[download]',
                 '.download-button',
                 '.btn-download',
                 '#download',
                 '#btn-download',
-                'a.download',
-                'button.download',
             ]
 
             for selector in download_selectors:
                 try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        logging.info(f"[Playwright] Clicking: {selector}")
+                    elements = await page.query_selector_all(selector)
+                    for el in elements:
                         try:
-                            async with page.expect_download(timeout=8000) as download_info:
-                                await element.click()
-                            download = await download_info.value
-                            if download.url:
-                                captured_url = download.url
-                                logging.info(f"[Playwright] Download event URL: {captured_url}")
-                                break
-                        except Exception:
-                            # Download event nahi aaya, bas click karke network se wait karo
+                            href = await el.get_attribute("href")
+                            if href:
+                                abs_url = make_absolute(href, base_url)
+                                # Skip images & bad URLs
+                                if is_image_url(abs_url) or has_bad_keyword(abs_url):
+                                    continue
+                                if is_video_url(abs_url) or 'get_file' in abs_url.lower():
+                                    score = 250
+                                    if '1080' in abs_url: score += 50
+                                    elif '720' in abs_url: score += 30
+                                    captured_urls.append((score, abs_url))
+                                    logging.info(f"[HREF] 🎯 {abs_url}")
+
+                            # Try clicking (download event)
                             try:
-                                await element.click()
+                                async with page.expect_download(timeout=4000) as dl_info:
+                                    await el.click()
+                                download = await dl_info.value
+                                if download.url and not is_image_url(download.url):
+                                    captured_urls.append((400, download.url))
+                                    logging.info(f"[DL-EVENT] 🎯 {download.url}")
                             except Exception:
                                 pass
-                            await page.wait_for_timeout(3000)
-                            if captured_url:
-                                break
+                        except Exception:
+                            continue
                 except Exception:
                     continue
 
-            # ---- Agar button se nahi mila, iframes check karo ----
-            if not captured_url:
+            # ---------- DOM EVAL FALLBACK ----------
+            if not captured_urls:
                 try:
-                    iframes = await page.query_selector_all("iframe")
-                    for iframe in iframes:
-                        src = await iframe.get_attribute("src")
-                        if src and any(ext in src.lower() for ext in ['.mp4', '.m3u8']):
-                            captured_url = src
-                            break
-                except Exception:
-                    pass
-
-            # ---- Last resort: page ke saare video/source tags ----
-            if not captured_url:
-                try:
-                    video_src = await page.evaluate("""
+                    dom_urls = await page.evaluate("""
                         () => {
-                            const v = document.querySelector('video');
-                            if (v && v.src) return v.src;
-                            const s = document.querySelector('video source');
-                            if (s && s.src) return s.src;
-                            return null;
+                            const results = [];
+                            document.querySelectorAll('video').forEach(v => {
+                                if (v.src) results.push(v.src);
+                                if (v.currentSrc) results.push(v.currentSrc);
+                            });
+                            document.querySelectorAll('video source').forEach(s => {
+                                if (s.src) results.push(s.src);
+                            });
+                            document.querySelectorAll('a').forEach(a => {
+                                const h = a.href || '';
+                                if (h.match(/\\.(mp4|m3u8|webm|mkv)/i) || h.includes('get_file') || h.includes('get_video')) {
+                                    results.push(h);
+                                }
+                            });
+                            return results;
                         }
                     """)
-                    if video_src:
-                        captured_url = video_src
-                except Exception:
-                    pass
+                    for vs in (dom_urls or []):
+                        if not vs:
+                            continue
+                        abs_u = make_absolute(vs, base_url)
+                        if is_image_url(abs_u) or has_bad_keyword(abs_u):
+                            continue
+                        if is_video_url(abs_u):
+                            score = 150 if '1080' in abs_u else 100
+                            captured_urls.append((score, abs_u))
+                            logging.info(f"[DOM] 🎯 {abs_u}")
+                except Exception as e:
+                    logging.debug(f"DOM eval err: {e}")
 
             await browser.close()
 
     except Exception as e:
         logging.error(f"[Playwright] Error: {e}")
 
-    return captured_url
+    # ---------- BEST URL SELECT ----------
+    if not captured_urls:
+        logging.warning("[Playwright] ❌ Koi valid video URL nahi mila")
+        return None
+
+    captured_urls.sort(reverse=True, key=lambda x: x[0])
+    best = captured_urls[0][1]
+
+    # Final safety: absolute banao
+    if base_url and not best.startswith("http"):
+        best = make_absolute(best, base_url)
+
+    # Final image check
+    if is_image_url(best):
+        logging.error(f"[Playwright] ❌ Best URL image hai, skip: {best}")
+        return None
+
+    logging.info(f"[Playwright] ✅ FINAL URL: {best}")
+    return best
 
 
 # ==========================================
 # 4. DOWNLOAD ENGINES
 # ==========================================
 def download_direct(url, output_path):
-    """Direct file download via Cloudscraper with dynamic Referer."""
+    """Direct download with Cloudscraper + cookies + image skip."""
     parsed_url = urlparse(url)
     referer = f"{parsed_url.scheme}://{parsed_url.netloc}/"
 
@@ -241,16 +359,35 @@ def download_direct(url, output_path):
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
+        "Range": "bytes=0-",
     }
 
     scraper = cloudscraper.create_scraper(
         browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
     )
 
-    response = scraper.get(url, headers=headers, stream=True, timeout=120)
+    # Load cookies.txt if exists
+    if os.path.exists('cookies.txt'):
+        try:
+            cj = http.cookiejar.MozillaCookieJar('cookies.txt')
+            cj.load(ignore_discard=True, ignore_expires=True)
+            scraper.cookies = cj
+            logging.info(f"[Direct] ✅ Loaded {len(cj)} cookies")
+        except Exception as e:
+            logging.warning(f"[Direct] Cookie load err: {e}")
+
+    response = scraper.get(url, headers=headers, stream=True, timeout=120, allow_redirects=True)
     response.raise_for_status()
 
-    total = int(response.headers.get("content-length", 0))
+    # ❌ Content-Type check
+    ctype = response.headers.get("content-type", "").lower()
+    if ctype.startswith("image/"):
+        raise Exception(f"❌ Ye thumbnail/image hai, video nahi! (Content-Type: {ctype})")
+
+    if "text/html" in ctype:
+        raise Exception(f"❌ HTML mila, video nahi (login/redirect issue). Content-Type: {ctype}")
+
+    total = int(response.headers.get("content-length", 0) or 0)
     downloaded = 0
 
     with open(output_path, 'wb') as f:
@@ -258,16 +395,21 @@ def download_direct(url, output_path):
             if chunk:
                 f.write(chunk)
                 downloaded += len(chunk)
-                if total:
-                    pct = (downloaded / total) * 100
-                    if pct % 20 < 1:
-                        logging.info(f"[Direct] {pct:.0f}% downloaded")
 
+    # ❌ Chhoti file check (thumbnail lagti hai)
+    if downloaded < 500 * 1024:
+        try:
+            os.remove(output_path)
+        except Exception:
+            pass
+        raise Exception(f"❌ File sirf {humanbytes(downloaded)} hai — thumbnail lagti hai!")
+
+    logging.info(f"[Direct] ✅ Downloaded {humanbytes(downloaded)}")
     return output_path
 
 
 def download_ytdlp(url, output_template):
-    """yt-dlp Engine with Cloudflare impersonation."""
+    """yt-dlp with Cloudflare impersonation."""
     parsed_url = urlparse(url)
     referer = f"{parsed_url.scheme}://{parsed_url.netloc}/"
 
@@ -296,7 +438,7 @@ def download_ytdlp(url, output_template):
 
 
 def gemini_extract_link(url):
-    """Fallback: Gemini AI HTML parse karke video link nikalta hai."""
+    """Gemini AI HTML parse fallback."""
     if not ai_model:
         return None
     try:
@@ -308,7 +450,8 @@ def gemini_extract_link(url):
 
         prompt = (
             "You are an expert web scraper. I am giving you the raw HTML of a video hosting webpage. "
-            "Find and extract the direct downloadable or playable video URL (ending in .mp4, .m3u8, or a source link inside video/iframe/a tags). "
+            "Find and extract the direct downloadable video URL (ending in .mp4, .m3u8, or inside video/iframe/a tags with download keyword). "
+            "IGNORE thumbnails (.jpg, .png, .webp) and preview images. "
             "Return ONLY the direct video URL. If no video link is found, return 'NOT_FOUND'.\n\n"
             f"Page URL: {url}\n\nHTML Snippet:\n{html_content}"
         )
@@ -317,6 +460,8 @@ def gemini_extract_link(url):
         extracted_url = ai_response.text.strip()
 
         if extracted_url and "http" in extracted_url and extracted_url != "NOT_FOUND":
+            if is_image_url(extracted_url):
+                return None
             return extracted_url
         return None
     except Exception as e:
@@ -331,9 +476,9 @@ def gemini_extract_link(url):
 async def start_cmd(_, message: Message):
     await message.reply_text(
         "👋 **Universal AI Video Downloader Bot**\n\n"
-        "Mujhe kisi bhi video ka **Webpage URL** ya **Direct Link** bhejo.\n"
+        "Mujhe kisi bhi video ka **Webpage URL** bhejo.\n"
         "Bot khud browser kholke download button click karega aur video bhej dega.\n\n"
-        "⚡ **Engines:** Playwright Browser → yt-dlp → Cloudscraper → Gemini AI"
+        "⚡ **Engines:** Playwright → yt-dlp → Cloudscraper → Gemini AI"
     )
 
 
@@ -360,8 +505,9 @@ async def process_url(_, message: Message):
     loop = asyncio.get_event_loop()
 
     try:
+        success = False
+
         # ============ STEP 1: Playwright Browser ============
-        browser_success = False
         try:
             await status_msg.edit_text("🌐 **Browser open kar raha hoon...**\n(Download button dhundh raha hoon)")
             extracted_url = await extract_video_url_via_browser(original_url)
@@ -372,41 +518,36 @@ async def process_url(_, message: Message):
                 final_file_path = await loop.run_in_executor(
                     None, download_direct, extracted_url, file_path
                 )
-                browser_success = True
+                success = True
         except Exception as e_browser:
             logging.warning(f"[Playwright] Failed: {e_browser}")
 
         # ============ STEP 2: yt-dlp Fallback ============
-        if not browser_success or not final_file_path:
+        if not success or not final_file_path:
             try:
                 await status_msg.edit_text("🔄 **Browser fail. yt-dlp try kar raha hoon...**")
                 out_template = os.path.join(DOWNLOAD_DIR, f"video_{timestamp}.%(ext)s")
                 final_file_path = await loop.run_in_executor(
                     None, download_ytdlp, original_url, out_template
                 )
-                browser_success = True
+                success = True
             except Exception as e1:
                 logging.warning(f"yt-dlp failed: {e1}")
 
         # ============ STEP 3: Direct URL check ============
-        if (not browser_success or not final_file_path):
-            is_direct = any(
-                ext in original_url.lower()
-                for ext in [".mp4", ".mkv", ".webm", ".m3u8"]
-            )
-            if is_direct:
-                try:
-                    await status_msg.edit_text("⚡ **Direct download attempt...**")
-                    file_path = os.path.join(DOWNLOAD_DIR, f"video_{timestamp}.mp4")
-                    final_file_path = await loop.run_in_executor(
-                        None, download_direct, original_url, file_path
-                    )
-                    browser_success = True
-                except Exception as e2:
-                    logging.warning(f"Direct failed: {e2}")
+        if (not success or not final_file_path) and is_video_url(original_url) and not is_image_url(original_url):
+            try:
+                await status_msg.edit_text("⚡ **Direct download attempt...**")
+                file_path = os.path.join(DOWNLOAD_DIR, f"video_{timestamp}.mp4")
+                final_file_path = await loop.run_in_executor(
+                    None, download_direct, original_url, file_path
+                )
+                success = True
+            except Exception as e2:
+                logging.warning(f"Direct failed: {e2}")
 
         # ============ STEP 4: Gemini AI Fallback ============
-        if (not browser_success or not final_file_path) and ai_model:
+        if (not success or not final_file_path) and ai_model:
             try:
                 await status_msg.edit_text("🤖 **Gemini AI se link dhundh raha hoon...**")
                 extracted_url = await loop.run_in_executor(
@@ -418,7 +559,7 @@ async def process_url(_, message: Message):
                     final_file_path = await loop.run_in_executor(
                         None, download_direct, extracted_url, file_path
                     )
-                    browser_success = True
+                    success = True
             except Exception as e3:
                 logging.warning(f"Gemini failed: {e3}")
 
@@ -431,7 +572,7 @@ async def process_url(_, message: Message):
                 "• e.g., `https://site.com/video/12345/title`"
             )
 
-        # ============ UPLOAD TO TELEGRAM ============
+        # ============ UPLOAD ============
         file_size = os.path.getsize(final_file_path)
 
         if file_size > 2 * 1024 * 1024 * 1024:
@@ -458,7 +599,6 @@ async def process_url(_, message: Message):
             pass
 
     finally:
-        # Cleanup
         for file in os.listdir(DOWNLOAD_DIR):
             if str(timestamp) in file:
                 try:
