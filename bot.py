@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import asyncio
 import logging
@@ -26,7 +27,6 @@ logging.basicConfig(
 
 app = Client("video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Gemini AI Setup
 if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
@@ -46,6 +46,54 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.ico', '.bmp']
 VIDEO_EXTS = ['.mp4', '.m3u8', '.webm', '.mkv', '.ts', '.mov', '.avi']
 BAD_KEYWORDS = ['preview', 'thumb', 'poster', 'sprite', 'trailer', 'placeholder', 'banner']
+
+# ==========================================
+# SITE-SPECIFIC CONFIG (Permanent for rule34video.com)
+# ==========================================
+SITE_SELECTORS = {
+    "rule34video.com": {
+        "download_selectors": [
+            'a[href*="/get_file/"]',
+            'a[href*="download"]',
+            'a[href*=".mp4"]',
+            'a:has-text("1080p")',
+            'a:has-text("720p")',
+            'a:has-text("480p")',
+            'a:has-text("Download")',
+            'a[download]',
+            '.download-button',
+            '.btn-download',
+            '#download',
+            '#btn-download',
+        ],
+        "title_selector": "h1, .video-title, .title",
+    },
+    # Baaki sites ke liye universal fallback
+    "default": {
+        "download_selectors": [
+            'a[href*="download"]',
+            'a[href*=".mp4"]',
+            'a[href*=".m3u8"]',
+            'a:has-text("Download")',
+            'a:has-text("Download Video")',
+            'a[download]',
+            '.download-button',
+            '.btn-download',
+            '#download',
+        ],
+        "title_selector": "h1, title",
+    }
+}
+
+
+def get_site_config(url: str) -> dict:
+    """URL ke domain ke hisaab se config return karta hai."""
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower().replace("www.", "")
+    for site, config in SITE_SELECTORS.items():
+        if site in domain:
+            return config
+    return SITE_SELECTORS["default"]
 
 
 # ==========================================
@@ -96,6 +144,41 @@ def make_absolute(url: str, base: str) -> str:
     return base.rstrip("/") + "/" + url
 
 
+def extract_quality_from_url(url: str) -> str:
+    """URL se quality detect karta hai."""
+    url_lower = url.lower()
+    for q in ["2160p", "1440p", "1080p", "720p", "480p", "360p", "240p"]:
+        if q in url_lower:
+            return q
+    return "Unknown"
+
+
+def sanitize_filename(name: str) -> str:
+    """Filename se invalid characters hatata hai."""
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    if len(name) > 150:
+        name = name[:150]
+    return name
+
+
+def parse_filename_from_url(video_url: str) -> str:
+    """Video URL se original filename nikalta hai."""
+    try:
+        parsed = urlparse(video_url)
+        path = parsed.path.rstrip("/")
+        basename = os.path.basename(path)
+        # Agar filename mein .mp4 hai to use karo
+        if basename and ('.' in basename):
+            return sanitize_filename(basename)
+        # Warna URL ke aakhri hisse se banao
+        if basename:
+            return sanitize_filename(basename)
+    except Exception:
+        pass
+    return None
+
+
 async def progress_status(current, total, status_msg, action_text, start_time):
     now = time.time()
     diff = now - start_time
@@ -122,16 +205,22 @@ async def progress_status(current, total, status_msg, action_text, start_time):
 
 
 # ==========================================
-# 3. PLAYWRIGHT - STRICT VIDEO URL EXTRACTION (NO LOOP)
+# 3. PLAYWRIGHT - UNIVERSAL VIDEO URL EXTRACTION
 # ==========================================
-async def extract_video_url_via_browser(page_url: str) -> str:
+async def extract_video_url_via_browser(page_url: str) -> dict:
     """
-    Browser kholta hai, download button/href se SIRF real VIDEO URL nikalta hai.
-    Pehla 1080p mil gaya to TURANT return karta hai — no loop.
+    Returns: {
+        "url": str,
+        "title": str,
+        "quality": str
+    }
+    Site-specific selectors use karta hai (rule34video.com permanent).
     """
     captured_urls = []   # (score, url)
-    seen_urls = set()    # Deduplication
+    seen_urls = set()
     base_url = None
+    page_title = None
+    site_config = get_site_config(page_url)
 
     try:
         async with async_playwright() as p:
@@ -155,7 +244,7 @@ async def extract_video_url_via_browser(page_url: str) -> str:
             )
             page = await context.new_page()
 
-            # ---------- NETWORK MONITOR (WITH DEDUP) ----------
+            # ---------- NETWORK MONITOR ----------
             async def handle_response(response):
                 try:
                     url = response.url
@@ -221,23 +310,32 @@ async def extract_video_url_via_browser(page_url: str) -> str:
 
             await page.wait_for_timeout(3000)
 
-            # ---------- HREF EXTRACTION (NO CLICK) ----------
-            download_selectors = [
-                'a[href*="1080"]',
-                'a[href*="720"]',
-                'a[href*="get_file"]',
-                'a[href*=".mp4"]',
-                'a[href*=".m3u8"]',
-                'a[href*="download"]',
-                'a:has-text("1080p")',
-                'a:has-text("MP4")',
-                'a:has-text("Download")',
-                'a[download]',
-                '.download-button',
-                '.btn-download',
-                '#download',
-                '#btn-download',
+            # ---------- TITLE EXTRACT ----------
+            try:
+                title_sel = site_config.get("title_selector", "h1")
+                page_title = await page.evaluate(f"""
+                    () => {{
+                        const el = document.querySelector('{title_sel}');
+                        return el ? el.textContent.trim() : document.title;
+                    }}
+                """)
+                logging.info(f"[Playwright] Title: {page_title[:80]}")
+            except Exception:
+                page_title = None
+
+            # ---------- HREF EXTRACTION (SITE-SPECIFIC) ----------
+            download_selectors = site_config.get("download_selectors", [])
+            # Universal selectors bhi add karo
+            download_selectors += [
+                'a[href*="1080"]', 'a[href*="720"]', 'a[href*="get_file"]',
+                'a[href*=".mp4"]', 'a[href*="download"]',
+                'a:has-text("1080p")', 'a:has-text("720p")',
+                'a:has-text("MP4")', 'a:has-text("Download")',
+                'a[download]', '.download-button', '.btn-download',
+                '#download', '#btn-download',
             ]
+            # Deduplicate selectors
+            download_selectors = list(dict.fromkeys(download_selectors))
 
             for selector in download_selectors:
                 try:
@@ -268,22 +366,23 @@ async def extract_video_url_via_browser(page_url: str) -> str:
                 except Exception:
                     continue
 
-            # ✅ 1080p mil gaya? Turant return karo
+            # ✅ 1080p mil gaya? Turant return
             best_1080 = [u for s, u in captured_urls if '1080' in u.lower()]
             if best_1080:
                 logging.info("[Playwright] ✅ 1080p HREF mil gaya, browser band kar raha hoon")
                 await browser.close()
-                return best_1080[0]
+                return {
+                    "url": best_1080[0],
+                    "title": page_title,
+                    "quality": extract_quality_from_url(best_1080[0])
+                }
 
             # ---------- CLICK ONLY IF NO HREF ----------
             if not captured_urls:
                 logging.info("[Playwright] HREF nahi mila, click try kar raha hoon...")
                 click_selectors = [
-                    'a:has-text("1080p")',
-                    'a:has-text("Download")',
-                    'button:has-text("Download")',
-                    'a[download]',
-                    '.download-button',
+                    'a:has-text("1080p")', 'a:has-text("Download")',
+                    'button:has-text("Download")', 'a[download]', '.download-button',
                 ]
                 clicked = False
                 for selector in click_selectors:
@@ -369,7 +468,11 @@ async def extract_video_url_via_browser(page_url: str) -> str:
         return None
 
     logging.info(f"[Playwright] ✅ FINAL URL: {best}")
-    return best
+    return {
+        "url": best,
+        "title": page_title,
+        "quality": extract_quality_from_url(best)
+    }
 
 
 # ==========================================
@@ -436,12 +539,12 @@ def download_direct(url, output_path):
 
 
 def download_ytdlp(url, output_template):
-    """yt-dlp with Cloudflare impersonation."""
+    """yt-dlp with Cloudflare impersonation + ORIGINAL FILENAME preserve."""
     parsed_url = urlparse(url)
     referer = f"{parsed_url.scheme}://{parsed_url.netloc}/"
 
     ydl_opts = {
-        'outtmpl': output_template,
+        'outtmpl': output_template,  # '%(title)s.%(ext)s' se original title aata hai
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'quiet': True,
         'no_warnings': True,
@@ -457,11 +560,18 @@ def download_ytdlp(url, output_template):
         },
         'retries': 3,
         'fragment_retries': 3,
+        'restrictfilenames': False,  # Original name preserve
+        'windowsfilenames': True,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
+        filename = ydl.prepare_filename(info)
+        return {
+            "path": filename,
+            "title": info.get('title', 'Unknown'),
+            "quality": f"{info.get('height', '?')}p" if info.get('height') else "Unknown"
+        }
 
 
 def gemini_extract_link(url):
@@ -476,11 +586,11 @@ def gemini_extract_link(url):
         html_content = response.text[:120000]
 
         prompt = (
-            "You are an expert web scraper. I am giving you the raw HTML of a video hosting webpage. "
-            "Find and extract the direct downloadable video URL (ending in .mp4, .m3u8, or inside video/iframe/a tags with download keyword). "
-            "IGNORE thumbnails (.jpg, .png, .webp) and preview images. "
-            "Return ONLY the direct video URL. If no video link is found, return 'NOT_FOUND'.\n\n"
-            f"Page URL: {url}\n\nHTML Snippet:\n{html_content}"
+            "You are an expert web scraper. Find the direct downloadable video URL "
+            "(ending in .mp4, .m3u8, or inside video/iframe/a tags with download keyword). "
+            "IGNORE thumbnails (.jpg, .png, .webp). "
+            "Return ONLY the direct video URL. If not found, return 'NOT_FOUND'.\n\n"
+            f"Page URL: {url}\n\nHTML:\n{html_content}"
         )
 
         ai_response = ai_model.generate_content(prompt)
@@ -503,9 +613,11 @@ def gemini_extract_link(url):
 async def start_cmd(_, message: Message):
     await message.reply_text(
         "👋 **Universal AI Video Downloader Bot**\n\n"
-        "Mujhe kisi bhi video ka **Webpage URL** bhejo.\n"
-        "Bot khud browser kholke download button click karega aur video bhej dega.\n\n"
-        "⚡ **Engines:** Playwright → yt-dlp → Cloudscraper → Gemini AI"
+        "✅ **Multiple links support!** Ek message mein jitne links chaho bhej do.\n"
+        "✅ **Original filename preserve** hota hai\n"
+        "✅ **Quality + Size caption** mein dikhta hai\n\n"
+        "⚡ **Engines:** Playwright → yt-dlp → Cloudscraper → Gemini AI\n\n"
+        "📌 **Special:** rule34video.com ke liye permanent selectors"
     )
 
 
@@ -516,31 +628,64 @@ async def help_cmd(_, message: Message):
         "1️⃣ Website ka **video page URL** copy karo\n"
         "2️⃣ Bot ko paste karke bhejo\n"
         "3️⃣ Bot automatically download button click karega\n"
-        "4️⃣ Video Telegram par upload ho jayegi\n\n"
-        "**Example:**\n"
-        "`https://example.com/video/12345/title`"
+        "4️⃣ Video original name + quality + size ke saath upload hogi\n\n"
+        "**Multiple links:** Ek message mein 10 links bhi bhej sakte ho!"
     )
 
 
-@app.on_message(filters.regex(r'https?://[^\s]+') & filters.private)
-async def process_url(_, message: Message):
-    original_url = message.text.strip()
-    status_msg = await message.reply_text("🔍 **Processing Link...**")
+@app.on_message(filters.command("queue") & filters.private)
+async def queue_cmd(_, message: Message):
+    await message.reply_text(
+        f"📊 **Queue Status**\n"
+        f"• Pending: `{download_queue.qsize()}`\n"
+        f"• Active: `{active_downloads}`"
+    )
 
-    timestamp = int(time.time())
+
+# ==========================================
+# GLOBAL QUEUE
+# ==========================================
+download_queue = asyncio.Queue()
+active_downloads = 0
+MAX_CONCURRENT = 2
+
+URL_REGEX = re.compile(r'https?://[^\s<>"\']+')
+
+
+# ==========================================
+# PROCESS SINGLE URL
+# ==========================================
+async def process_single_url(client, chat_id, original_url, reply_to_msg):
+    """Ek URL process karke video bhejta hai — original filename + quality + size ke saath."""
+    global active_downloads
+    active_downloads += 1
+
+    timestamp = int(time.time() * 1000) + active_downloads
     final_file_path = ""
+    video_title = "video"
+    video_quality = "Unknown"
     loop = asyncio.get_event_loop()
+    status_msg = await client.send_message(chat_id, f"🔍 **Processing:** `{original_url[:60]}...`")
 
     try:
         success = False
 
-        # ============ STEP 1: Playwright Browser ============
+        # ---------- STEP 1: Playwright ----------
         try:
-            await status_msg.edit_text("🌐 **Browser open kar raha hoon...**\n(Download button dhundh raha hoon)")
-            extracted_url = await extract_video_url_via_browser(original_url)
+            await status_msg.edit_text(f"🌐 **Browser opening...**\n`{original_url[:60]}`")
+            result = await extract_video_url_via_browser(original_url)
 
-            if extracted_url:
-                await status_msg.edit_text("✅ **Direct video link mil gaya!**\n📥 Download start...")
+            if result and result.get("url"):
+                extracted_url = result["url"]
+                video_title = result.get("title") or "video"
+                video_quality = result.get("quality") or "Unknown"
+
+                # Original filename URL se bhi nikal sakte hain
+                url_filename = parse_filename_from_url(extracted_url)
+                if url_filename:
+                    video_title = url_filename.rsplit('.', 1)[0]
+
+                await status_msg.edit_text("✅ **Link mila! Downloading...**")
                 file_path = os.path.join(DOWNLOAD_DIR, f"video_{timestamp}.mp4")
                 final_file_path = await loop.run_in_executor(
                     None, download_direct, extracted_url, file_path
@@ -549,19 +694,24 @@ async def process_url(_, message: Message):
         except Exception as e_browser:
             logging.warning(f"[Playwright] Failed: {e_browser}")
 
-        # ============ STEP 2: yt-dlp Fallback ============
+        # ---------- STEP 2: yt-dlp ----------
         if not success or not final_file_path:
             try:
-                await status_msg.edit_text("🔄 **Browser fail. yt-dlp try kar raha hoon...**")
-                out_template = os.path.join(DOWNLOAD_DIR, f"video_{timestamp}.%(ext)s")
-                final_file_path = await loop.run_in_executor(
+                await status_msg.edit_text("🔄 **yt-dlp try kar raha hoon...**")
+                # Original title preserve ke liye template
+                out_template = os.path.join(DOWNLOAD_DIR, f"%(title)s_{timestamp}.%(ext)s")
+                result = await loop.run_in_executor(
                     None, download_ytdlp, original_url, out_template
                 )
+                if result and result.get("path"):
+                    final_file_path = result["path"]
+                    video_title = result.get("title", video_title)
+                    video_quality = result.get("quality", video_quality)
                 success = True
             except Exception as e1:
                 logging.warning(f"yt-dlp failed: {e1}")
 
-        # ============ STEP 3: Direct URL check ============
+        # ---------- STEP 3: Direct URL ----------
         if (not success or not final_file_path) and is_video_url(original_url) and not is_image_url(original_url):
             try:
                 await status_msg.edit_text("⚡ **Direct download attempt...**")
@@ -569,28 +719,33 @@ async def process_url(_, message: Message):
                 final_file_path = await loop.run_in_executor(
                     None, download_direct, original_url, file_path
                 )
+                # URL se filename nikaalo
+                url_fn = parse_filename_from_url(original_url)
+                if url_fn:
+                    video_title = url_fn.rsplit('.', 1)[0]
+                video_quality = extract_quality_from_url(original_url)
                 success = True
             except Exception as e2:
                 logging.warning(f"Direct failed: {e2}")
 
-        # ============ STEP 4: Gemini AI Fallback ============
+        # ---------- STEP 4: Gemini AI ----------
         if (not success or not final_file_path) and ai_model:
             try:
-                await status_msg.edit_text("🤖 **Gemini AI se link dhundh raha hoon...**")
+                await status_msg.edit_text("🤖 **Gemini AI se link...**")
                 extracted_url = await loop.run_in_executor(
                     None, gemini_extract_link, original_url
                 )
                 if extracted_url:
-                    await status_msg.edit_text("🧠 **AI ne link nikala! Downloading...**")
                     file_path = os.path.join(DOWNLOAD_DIR, f"video_ai_{timestamp}.mp4")
                     final_file_path = await loop.run_in_executor(
                         None, download_direct, extracted_url, file_path
                     )
+                    video_quality = extract_quality_from_url(extracted_url)
                     success = True
             except Exception as e3:
                 logging.warning(f"Gemini failed: {e3}")
 
-        # ============ FINAL CHECK ============
+        # ---------- FINAL CHECK ----------
         if not final_file_path or not os.path.exists(final_file_path):
             raise Exception(
                 "❌ Video extract nahi ho paaya.\n\n"
@@ -599,20 +754,51 @@ async def process_url(_, message: Message):
                 "• e.g., `https://site.com/video/12345/title`"
             )
 
-        # ============ UPLOAD ============
+        # ---------- FILE SIZE ----------
         file_size = os.path.getsize(final_file_path)
 
         if file_size > 2 * 1024 * 1024 * 1024:
             raise Exception("❌ File 2GB se badi hai. Telegram limit exceed.")
 
+        # ---------- CAPTION BUILD ----------
+        # Original filename (extension ke saath)
+        orig_filename = os.path.basename(final_file_path)
+        # Agar timestamp suffix hai to hata do caption ke liye
+        clean_name = re.sub(r'_\d+\.(mp4|mkv|webm|avi|mov)$', '', orig_filename, flags=re.IGNORECASE)
+        if not clean_name:
+            clean_name = sanitize_filename(video_title)
+
+        # Quality detect
+        if video_quality == "Unknown" and '1080' in orig_filename:
+            video_quality = "1080p"
+        elif video_quality == "Unknown" and '720' in orig_filename:
+            video_quality = "720p"
+        elif video_quality == "Unknown" and '480' in orig_filename:
+            video_quality = "480p"
+
+        caption = (
+            f"✅ **Downloaded Successfully!**\n\n"
+            f"🎬 **Name:** `{clean_name}`\n"
+            f"📺 **Quality:** `{video_quality}`\n"
+            f"📦 **Size:** `{humanbytes(file_size)}`\n"
+            f"🔗 **Source:** `{original_url[:80]}`"
+        )
+
+        # ---------- UPLOAD ----------
         await status_msg.edit_text(
-            f"📤 **Uploading to Telegram...**\n📦 Size: `{humanbytes(file_size)}`"
+            f"📤 **Uploading to Telegram...**\n"
+            f"🎬 Name: `{clean_name}`\n"
+            f"📦 Size: `{humanbytes(file_size)}`"
         )
         start_time = time.time()
 
-        await message.reply_video(
+        # file_name parameter se Telegram par original name dikhega
+        await client.send_video(
+            chat_id=chat_id,
             video=final_file_path,
-            caption="✅ **Downloaded Successfully!**",
+            file_name=orig_filename,  # ✅ Original filename preserve
+            caption=caption,
+            reply_to_message_id=reply_to_msg,
             progress=progress_status,
             progress_args=(status_msg, "Uploading", start_time)
         )
@@ -621,7 +807,7 @@ async def process_url(_, message: Message):
     except Exception as e:
         logging.error(f"[Bot] Error: {e}")
         try:
-            await status_msg.edit_text(f"❌ **Error:**\n`{str(e)}`")
+            await status_msg.edit_text(f"❌ **Error:**\n`{str(e)[:300]}`")
         except Exception:
             pass
 
@@ -632,8 +818,72 @@ async def process_url(_, message: Message):
                     os.remove(os.path.join(DOWNLOAD_DIR, file))
                 except Exception:
                     pass
+        active_downloads -= 1
+
+
+# ==========================================
+# QUEUE WORKER
+# ==========================================
+async def queue_worker(client):
+    """Queue se ek-ek karke URL uthata hai aur process karta hai."""
+    while True:
+        try:
+            job = await download_queue.get()
+            if job is None:
+                break
+            chat_id, url, reply_to = job
+            try:
+                await process_single_url(client, chat_id, url, reply_to)
+            except Exception as e:
+                logging.error(f"[Worker] Job failed: {e}")
+            download_queue.task_done()
+        except Exception as e:
+            logging.error(f"[Worker] Error: {e}")
+            await asyncio.sleep(2)
+
+
+# ==========================================
+# MAIN HANDLER — Multiple URLs Extract
+# ==========================================
+@app.on_message(filters.regex(r'https?://') & filters.private)
+async def process_url(client, message: Message):
+    text = message.text or ""
+    urls = URL_REGEX.findall(text)
+    urls = list(dict.fromkeys(urls))
+
+    if not urls:
+        return
+
+    if len(urls) == 1:
+        await message.reply_text("📥 **Queue mein add ho gaya...**")
+        await download_queue.put((message.chat.id, urls[0], message.id))
+        return
+
+    await message.reply_text(
+        f"📥 **{len(urls)} links queue mein add ho gaye!**\n"
+        f"📊 Active: `{active_downloads}` | Pending: `{download_queue.qsize()}`\n"
+        f"⏳ Ek-ek karke process honge..."
+    )
+    for url in urls:
+        await download_queue.put((message.chat.id, url, message.id))
+
+
+# ==========================================
+# MAIN — App start + worker tasks
+# ==========================================
+async def main():
+    await app.start()
+    logging.info("🚀 Bot started, launching queue workers...")
+
+    workers = [asyncio.create_task(queue_worker(app)) for _ in range(MAX_CONCURRENT)]
+
+    from pyrogram import idle
+    await idle()
+
+    for w in workers:
+        w.cancel()
 
 
 if __name__ == "__main__":
     logging.info("🚀 Bot starting...")
-    app.run()
+    app.run(main())
