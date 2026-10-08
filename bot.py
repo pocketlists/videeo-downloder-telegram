@@ -2,7 +2,8 @@ import os
 import time
 import asyncio
 import logging
-import requests
+import cloudscraper
+from urllib.parse import urlparse
 import yt_dlp
 import google.generativeai as genai
 from pyrogram import Client, filters
@@ -25,7 +26,7 @@ app = Client("video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token
 # Initialize Gemini API
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    ai_model = genai.GenerativeModel('gemini-3.8-flash')
+    ai_model = genai.GenerativeModel('gemini-1.5-flash')
 else:
     logging.warning("GEMINI_API_KEY not found! AI Fallback will not work.")
 
@@ -50,6 +51,7 @@ async def progress_status(current, total, status_msg, action_text, start_time):
     if not hasattr(progress_status, "last_update"):
         progress_status.last_update = 0
         
+    # Telegram API flood limit bypass karne ke liye har 3 second mein update
     if now - progress_status.last_update > 3 or current == total:
         progress_status.last_update = now
         percentage = (current / total) * 100
@@ -66,15 +68,38 @@ async def progress_status(current, total, status_msg, action_text, start_time):
             pass
 
 # ==========================================
-# 3. DOWNLOAD ENGINES
+# 3. DOWNLOAD ENGINES (Fixed for 403 Forbidden)
 # ==========================================
 def download_direct(url, output_path):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    with requests.get(url, headers=headers, stream=True) as r:
-        r.raise_for_status()
-        with open(output_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=1024*1024):
-                if chunk: f.write(chunk)
+    # Dynamic Referer header extract karein 403 bypass ke liye
+    parsed_url = urlparse(url)
+    referer = f"{parsed_url.scheme}://{parsed_url.netloc}/"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer": referer,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive"
+    }
+
+    # Cloudflare aur 403 Forbidden bypass karne ke liye cloudscraper
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
+    
+    response = scraper.get(url, headers=headers, stream=True, timeout=30)
+    response.raise_for_status()
+
+    with open(output_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=1024*1024):
+            if chunk:
+                f.write(chunk)
+                
     return output_path
 
 def download_ytdlp(url, output_template):
@@ -83,7 +108,10 @@ def download_ytdlp(url, output_template):
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'quiet': True,
         'no_warnings': True,
-        'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None
+        'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        }
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -94,9 +122,9 @@ def download_ytdlp(url, output_template):
 # ==========================================
 def gemini_extract_link(url):
     try:
-        # Fetch Webpage HTML
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        response = requests.get(url, headers=headers, timeout=10)
+        # Webpage ka HTML fetch karne ke liye bhi cloudscraper use karenge taaki 403 na aaye
+        scraper = cloudscraper.create_scraper()
+        response = scraper.get(url, timeout=15)
         html_content = response.text[:100000] # Limit to 100k chars to save tokens
         
         prompt = (
@@ -123,7 +151,7 @@ def gemini_extract_link(url):
 async def start_cmd(_, message: Message):
     await message.reply_text(
         "👋 **Advanced AI Downloader Bot Started!**\n\n"
-        "Bhejo koi bhi link. Agar normal downloader fail hua, to mera AI Engine usko bypass karke video nikal lega."
+        "Bhejo koi bhi link. Cloudflare bypass aur AI Fallback engine active hai."
     )
 
 @app.on_message(filters.regex(r'https?://[^\s]+') & filters.private)
@@ -140,7 +168,7 @@ async def process_url(_, message: Message):
         is_direct = any(ext in original_url.lower() for ext in [".mp4", ".mkv", ".webm", ".m3u8"])
         
         if is_direct:
-            await status_msg.edit_text("⚡ **Direct Link Detected. Downloading...**")
+            await status_msg.edit_text("⚡ **Direct Link Detected. Bypassing 403 & Downloading...**")
             file_path = os.path.join(DOWNLOAD_DIR, f"video_{timestamp}.mp4")
             final_file_path = await loop.run_in_executor(None, download_direct, original_url, file_path)
             
@@ -160,11 +188,11 @@ async def process_url(_, message: Message):
                 
                 if extracted_url:
                     await status_msg.edit_text(f"🧠 **AI found hidden link!** Downloading...\n`{extracted_url[:30]}...`")
-                    # Download the AI extracted link
+                    # Download the AI extracted link using cloudscraper
                     file_path = os.path.join(DOWNLOAD_DIR, f"video_ai_{timestamp}.mp4")
                     final_file_path = await loop.run_in_executor(None, download_direct, extracted_url, file_path)
                 else:
-                    raise Exception("AI could not find the hidden video source. Link might be fully protected or expired.")
+                    raise Exception("AI could not find the video source or Cloudflare strictly blocked access.")
 
         # Step 4: Upload to Telegram
         if not final_file_path or not os.path.exists(final_file_path):
