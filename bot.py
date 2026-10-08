@@ -25,7 +25,7 @@ app = Client("video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token
 # Initialize Gemini API
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    ai_model = genai.GenerativeModel('gemini-1.5-flash')
+    ai_model = genai.GenerativeModel('gemini-3.8-flash')
 else:
     logging.warning("GEMINI_API_KEY not found! AI Fallback will not work.")
 
