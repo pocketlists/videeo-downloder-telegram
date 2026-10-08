@@ -2,12 +2,13 @@ name: Run Telegram Video Downloader Bot
 
 on:
   schedule:
-    - cron: '0 */5 * * *'  # Har 5 ghante mein auto-restart
+    - cron: '0 */5 * * *'   # Har 5 ghante auto-restart
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
 
     steps:
       - name: Checkout Repo Code
@@ -18,10 +19,10 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install System Dependencies (FFmpeg)
+      - name: Install System Dependencies (FFmpeg + Playwright deps)
         run: |
-          sudo apt update
-          sudo apt install -y ffmpeg
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
       - name: Install Python Packages
         run: |
@@ -29,11 +30,18 @@ jobs:
           pip install -r requirements.txt
           pip install --upgrade yt-dlp
 
+      - name: Install Playwright Chromium Browser
+        run: |
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
+
       - name: Create cookies.txt (If secret exists)
         run: |
           if [ -n "$COOKIES_DATA" ]; then
             echo "$COOKIES_DATA" > cookies.txt
-            echo "cookies.txt created."
+            echo "✅ cookies.txt created."
+          else
+            echo "⚠️ No cookies secret, skipping."
           fi
         env:
           COOKIES_DATA: ${{ secrets.COOKIES }}
