@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import time
 import html
@@ -15,10 +16,9 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from urllib.parse import urlparse, urljoin, unquote
 
-import sys
 if os.environ.get("AUTO_UPDATE", "1") == "1":
     try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-U", "-q", "yt-dlp[default]", "curl_cffi"],
+        subprocess.run([sys.executable, "-m", "pip", "install", "-U", "-q", "yt-dlp[default,curl-cffi]"],
                        capture_output=True, timeout=150)
     except Exception:
         pass
@@ -47,6 +47,8 @@ UPLOAD_LIMIT = int(os.environ.get("UPLOAD_LIMIT_MB", 1990)) * MiB
 COMPRESS_TARGET = int(os.environ.get("COMPRESS_TARGET_MB", 1900)) * MiB
 MAX_HEIGHT = 1080
 FALLBACK_HEIGHT = 720
+TIERS = (MAX_HEIGHT, FALLBACK_HEIGHT, 480)
+QUALITIES = (0,) + TIERS
 COOKIES_FILE = "cookies.txt"
 
 DOWNLOAD_DIR = "./downloads/"
@@ -88,8 +90,11 @@ ANALYZE_SEM = None
 DL_SEM = None
 active_downloads = 0
 analyzing = 0
+NO_IMP = False
 BG_TASKS = set()
 URL_REGEX = re.compile(r'https?://[^\s<>"\']+')
+TIME_PAT = r"\d{1,2}(?::\d{1,2}){1,2}"
+RANGE_RE = re.compile(rf"(?<![\d:])({TIME_PAT})\s*(?:-|–|—|to|se)\s*({TIME_PAT})(?![\d:])", re.I)
 
 
 def spawn(coro):
@@ -179,6 +184,21 @@ def fmt_hms(sec) -> str:
     h, r = divmod(sec, 3600)
     m, s = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def to_sec(t: str) -> float:
+    n = 0
+    for x in t.split(":"):
+        n = n * 60 + int(x)
+    return float(n)
+
+
+def parse_range(text):
+    m = RANGE_RE.search(text or "")
+    if not m:
+        return None
+    a, b = to_sec(m.group(1)), to_sec(m.group(2))
+    return (a, b) if b > a else None
 
 
 def sanitize_filename(name: str) -> str:
@@ -328,6 +348,9 @@ class Job:
     fresh: bool = True
     busy: bool = False
     thumb_path: str = ""
+    thumb_sent: bool = False
+    reply_to: int = None
+    q: int = 0
 
 
 def ffprobe(target, headers=None, timeout=40):
@@ -363,13 +386,18 @@ def ffprobe(target, headers=None, timeout=40):
     except Exception:
         pass
     w, h = int((v or {}).get("width") or 0), int((v or {}).get("height") or 0)
+    dur = num(fmt.get("duration")) or num((v or {}).get("duration"))
+    size = int(num(fmt.get("size")))
+    a_bps = int(num((a or {}).get("bit_rate")))
+    v_bps = int(num((v or {}).get("bit_rate")))
+    if v and not v_bps and dur and size:
+        v_bps = max(int(size * 8 / dur) - a_bps, 0)
     return {
-        "duration": num(fmt.get("duration")) or num((v or {}).get("duration")),
-        "size": int(num(fmt.get("size"))),
+        "duration": dur, "size": size,
         "width": w, "height": h, "short": min(w, h) if w and h else 0,
         "vcodec": (v or {}).get("codec_name"), "pix_fmt": (v or {}).get("pix_fmt"),
-        "fps": fps, "v_bps": int(num((v or {}).get("bit_rate"))),
-        "acodec": (a or {}).get("codec_name"), "a_bps": int(num((a or {}).get("bit_rate"))),
+        "fps": fps, "v_bps": v_bps,
+        "acodec": (a or {}).get("codec_name"), "a_bps": a_bps,
         "ar": int(num((a or {}).get("sample_rate"))), "ch": int((a or {}).get("channels") or 0),
     }
 
@@ -425,6 +453,13 @@ def grab_frame(src, out_jpg, at=5.0, headers=None, width=None, quality=2):
     return os.path.exists(out_jpg) and os.path.getsize(out_jpg) > 1000
 
 
+def _rm(p):
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+
+
 def ensure_compatible(path, on_progress=None):
     info = ffprobe(path)
     if not info:
@@ -438,69 +473,70 @@ def ensure_compatible(path, on_progress=None):
     if ok_v and ok_a:
         args = ["-i", path] + maps + ["-c", "copy"]
     elif ok_v:
-        args = ["-i", path] + maps + ["-c:v", "copy", "-c:a", "aac", "-b:a", "160k"]
+        args = ["-i", path] + maps + ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k"]
     else:
-        args = ["-i", path] + maps + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                                      "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k"]
+        enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"]
+        if info["v_bps"]:
+            cap = int(max(info["v_bps"] * 1.5, 1_500_000))
+            enc += ["-maxrate", str(cap), "-bufsize", str(cap * 2)]
+        args = ["-i", path] + maps + enc + ["-c:a", "aac", "-b:a", "128k"]
     run_ffmpeg(args + ["-movflags", "+faststart", out], info["duration"], on_progress)
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+    _rm(path)
     return out
 
 
-def _audio_args(info):
-    if not info["acodec"]:
-        return ["-an"], ["-an"]
-    enc = ["-c:a", "aac", "-b:a", "128k"]
-    extra = (["-ar", str(info["ar"])] if info["ar"] else []) + (["-ac", str(info["ch"])] if info["ch"] else [])
-    return (["-c:a", "copy"] if info["acodec"] == "aac" else enc + extra), enc + extra
+def _venc(info, crf):
+    o = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+    vb = info["v_bps"]
+    if vb:
+        vb = max(vb, 600_000)
+        o += ["-maxrate", str(vb), "-bufsize", str(vb * 2)]
+    return o
 
 
-def _concat_ts(parts, dst, has_a, D):
+def _assemble(parts, src, dst, a_ss, a_dur, has_a, dur):
     lst = dst + ".list.txt"
     with open(lst, "w") as f:
         for p in parts:
             f.write("file '" + os.path.abspath(p).replace("'", "'\\''") + "'\n")
-    bsf = ["-bsf:a", "aac_adtstoasc"] if has_a else []
+    args = ["-f", "concat", "-safe", "0", "-i", lst]
+    if has_a:
+        args += ["-ss", f"{a_ss:.3f}", "-t", f"{a_dur:.3f}", "-i", src]
+    args += ["-map", "0:v:0"] + (["-map", "1:a:0"] if has_a else [])
+    args += ["-c", "copy", "-t", f"{dur:.3f}", "-movflags", "+faststart", dst]
     try:
-        run_ffmpeg(["-f", "concat", "-safe", "0", "-i", lst, "-map", "0", "-c", "copy"] + bsf +
-                   ["-movflags", "+faststart", dst], D)
+        run_ffmpeg(args, dur)
     finally:
         for p in parts + [lst]:
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+            _rm(p)
 
 
 def smart_cut(src, dst, start, end, info, cb=None):
     dur = end - start
-    a_copy, a_enc = _audio_args(info)
-    maps = ["-map", "0:v:0", "-map", "0:a:0?"]
-    enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-pix_fmt", "yuv420p"] + a_enc
+    has_a = bool(info["acodec"])
+    enc = _venc(info, 18)
     prog = (lambda c, t: cb.update("✂️ Cutting", c, t, "time")) if cb else None
     kfs = keyframe_times(src) if info["vcodec"] == "h264" and dur > 40 else []
     k1 = next((k for k in kfs if k >= start), None)
     k2 = max((k for k in kfs if k <= end), default=None)
     if k1 is None or k2 is None or k2 - k1 < 6:
-        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}"] + maps + enc +
-                   ["-movflags", "+faststart", dst], dur, prog)
+        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}", "-map", "0:v:0", "-map", "0:a:0?"] + enc +
+                   (["-c:a", "copy"] if has_a else ["-an"]) + ["-movflags", "+faststart", dst], dur, prog)
         return
     work = os.path.dirname(dst) or "."
     a, b, c = (os.path.join(work, n) for n in ("cut_a.ts", "cut_b.ts", "cut_c.ts"))
+    vmap = ["-map", "0:v:0", "-an"]
     parts = []
     if k1 - start > 0.05:
-        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{k1 - start:.3f}"] + maps + enc + ["-f", "mpegts", a])
+        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{k1 - start:.3f}"] + vmap + enc + ["-f", "mpegts", a])
         parts.append(a)
-    run_ffmpeg(["-ss", f"{k1 + 0.005:.3f}", "-i", src, "-t", f"{k2 - k1:.3f}"] + maps +
-               ["-c:v", "copy"] + a_copy + ["-f", "mpegts", b], k2 - k1, prog)
+    run_ffmpeg(["-ss", f"{k1 + 0.005:.3f}", "-i", src, "-t", f"{k2 - k1:.3f}"] + vmap +
+               ["-c:v", "copy", "-f", "mpegts", b], k2 - k1, prog)
     parts.append(b)
     if end - k2 > 0.05:
-        run_ffmpeg(["-ss", f"{k2:.3f}", "-i", src, "-t", f"{end - k2:.3f}"] + maps + enc + ["-f", "mpegts", c])
+        run_ffmpeg(["-ss", f"{k2:.3f}", "-i", src, "-t", f"{end - k2:.3f}"] + vmap + enc + ["-f", "mpegts", c])
         parts.append(c)
-    _concat_ts(parts, dst, bool(info["acodec"]), dur)
+    _assemble(parts, src, dst, start, dur, has_a, dur)
 
 
 def cut_video(src, dst, start, end, mode, info, cb=None):
@@ -537,8 +573,8 @@ def _compress_partial(src, dst, info, target, cb):
     if len(kfs) < 6:
         return False
     has_a = bool(info["acodec"])
-    a_new = 128_000 if has_a else 0
-    a_old = info["a_bps"] or a_new
+    a_old = info["a_bps"] or (128_000 if has_a else 0)
+    a_new = a_old
     B = S * 8 / D
     v_old = max(B - a_old, 300_000)
     delta = S * 8 - target * 8
@@ -590,19 +626,17 @@ def _compress_partial(src, dst, info, target, cb):
 
 
 def _build_spliced(src, dst, info, k1, k2, vm, work, cb):
-    has_a = bool(info["acodec"])
     head, mid, tail = (os.path.join(work, n) for n in ("seg_head.ts", "seg_mid.ts", "seg_tail.ts"))
-    a_copy, a_enc = _audio_args(info)
-    maps = ["-map", "0:v:0", "-map", "0:a:0?"]
+    vmap = ["-map", "0:v:0", "-an"]
     D = info["duration"]
-    run_ffmpeg(["-i", src, "-t", f"{k1:.3f}"] + maps + ["-c:v", "copy"] + a_copy + ["-f", "mpegts", head])
-    run_ffmpeg(["-ss", f"{k2 + 0.005:.3f}", "-i", src] + maps + ["-c:v", "copy"] + a_copy + ["-f", "mpegts", tail])
+    run_ffmpeg(["-i", src, "-t", f"{k1:.3f}"] + vmap + ["-c:v", "copy", "-f", "mpegts", head])
+    run_ffmpeg(["-ss", f"{k2 + 0.005:.3f}", "-i", src] + vmap + ["-c:v", "copy", "-f", "mpegts", tail])
     vb = int(vm)
-    run_ffmpeg(["-ss", f"{k1:.3f}", "-i", src, "-t", f"{k2 - k1:.3f}"] + maps +
+    run_ffmpeg(["-ss", f"{k1:.3f}", "-i", src, "-t", f"{k2 - k1:.3f}"] + vmap +
                ["-c:v", "libx264", "-preset", "veryfast", "-b:v", str(vb), "-maxrate", str(int(vb * 1.3)),
-                "-bufsize", str(vb * 2), "-pix_fmt", "yuv420p"] + a_enc + ["-f", "mpegts", mid],
+                "-bufsize", str(vb * 2), "-pix_fmt", "yuv420p", "-f", "mpegts", mid],
                k2 - k1, (lambda c, t: cb.update("🗜 Compressing (beech ka hissa)", c, t, "time")) if cb else None)
-    _concat_ts([head, mid, tail], dst, has_a, D)
+    _assemble([head, mid, tail], src, dst, 0.0, D, bool(info["acodec"]), D)
 
 
 def _compress_full(src, dst, info, target, cb):
@@ -626,6 +660,16 @@ def _compress_full(src, dst, info, target, cb):
     raise RuntimeError("Compress ke baad bhi file 2GB se badi hai")
 
 
+def extract_audio(path, out, title, cb=None):
+    info = ffprobe(path)
+    if not info or not info["acodec"]:
+        raise RuntimeError("Is video mein audio nahi hai")
+    a = ["-c:a", "copy"] if info["acodec"] == "aac" else ["-c:a", "aac", "-b:a", "192k"]
+    run_ffmpeg(["-i", path, "-vn", "-map", "0:a:0"] + a +
+               ["-metadata", f"title={title}", "-movflags", "+faststart", out], info["duration"], cb)
+    return out, ffprobe(out) or info
+
+
 class Progress:
     def __init__(self, loop, msg, header=""):
         self.loop, self.msg, self.header = loop, msg, header
@@ -646,9 +690,10 @@ class Progress:
             body = f"Progress: <code>{pct}</code>  (<code>{fmt_dur(done)}/{fmt_dur(total)}</code>)"
         else:
             speed = done / max(now - self.t0, 0.1)
+            eta = (total - done) / speed if total and speed else 0
             body = (f"Progress: <code>{pct}</code>\n"
                     f"Size: <code>{humanbytes(done)} / {humanbytes(total)}</code>\n"
-                    f"Speed: <code>{humanbytes(speed)}/s</code>")
+                    f"Speed: <code>{humanbytes(speed)}/s</code>  ETA: <code>{fmt_dur(eta)}</code>")
         text = f"{self.header}\n⏳ <b>{stage}</b>\n{body}"
         asyncio.run_coroutine_threadsafe(self._edit(text), self.loop)
 
@@ -672,17 +717,30 @@ def base_ydl_opts(headers=None, fast=False):
     }
     if os.path.exists(COOKIES_FILE):
         o["cookiefile"] = COOKIES_FILE
-    imp = impersonate_target()
+    imp = None if NO_IMP else impersonate_target()
     if imp:
         o["impersonate"] = imp
     return o
 
 
+def ydl_call(opts, fn):
+    global NO_IMP
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return fn(ydl)
+    except Exception as e:
+        if "impersonat" in str(e).lower() and "impersonate" in opts:
+            NO_IMP = True
+            opts.pop("impersonate")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return fn(ydl)
+        raise
+
+
 def ytdlp_extract(url, headers=None):
     opts = base_ydl_opts(headers, True)
-    opts.update({"skip_download": True})
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    opts["skip_download"] = True
+    info = ydl_call(opts, lambda y: y.extract_info(url, download=False))
     if info and info.get("_type") == "playlist":
         info = next((e for e in (info.get("entries") or []) if e), None)
     return info
@@ -735,7 +793,7 @@ def source_from_ytinfo(url, info, headers, cookies):
                title=info.get("title") or name_from_url(url) or "video",
                duration=float(info.get("duration") or 0), thumbs=collect_thumbs(info))
     s.formats = compact_formats(info)
-    s.est = {h: est_size(s.formats, s.duration, h) for h in (MAX_HEIGHT, FALLBACK_HEIGHT)}
+    s.est = {h: est_size(s.formats, s.duration, h) for h in TIERS}
     s.height = s.est[MAX_HEIGHT][1] or int(info.get("height") or 0)
     return s
 
@@ -759,7 +817,7 @@ async def source_from_media(media_url, page_url, cookies, title=None, thumbs=Non
             if yi:
                 s.formats = compact_formats(yi)
                 s.duration = s.duration or float(yi.get("duration") or 0)
-                s.est = {h: est_size(s.formats, s.duration, h) for h in (MAX_HEIGHT, FALLBACK_HEIGHT)}
+                s.est = {h: est_size(s.formats, s.duration, h) for h in TIERS}
                 s.height = s.est[MAX_HEIGHT][1] or s.height
         except Exception as e:
             logging.info(f"[yt-dlp] m3u8 info fail: {e}")
@@ -1128,33 +1186,32 @@ def _largest_media_file(workdir):
     return best
 
 
-def ytdlp_download(url, workdir, headers, max_h, prog):
+def ytdlp_download(url, workdir, headers, max_h, prog, audio=False):
     def hook(d):
         if d.get("status") == "downloading":
             prog.update("⬇️ Downloading", d.get("downloaded_bytes") or 0,
                         d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
 
     sort = [f"res:{max_h}", "vcodec:h264", "proto", "acodec:aac", "ext:mp4:m4a"]
+    plans = (("ba/b", None), ("b", None)) if audio else (("bv*+ba/b", sort), ("b/bv*+ba", None))
     last = None
-    for fmt, srt in (("bv*+ba/b", sort), ("b/bv*+ba", None)):
+    for fmt, srt in plans:
         opts = base_ydl_opts(headers)
         opts.update({
-            "outtmpl": os.path.join(workdir, "dl.%(ext)s"), "format": fmt, "merge_output_format": "mp4",
+            "outtmpl": os.path.join(workdir, "dl.%(ext)s"), "format": fmt,
             "concurrent_fragment_downloads": 8, "progress_hooks": [hook], "noprogress": True,
         })
+        if not audio:
+            opts["merge_output_format"] = "mp4"
         if srt:
             opts["format_sort"] = srt
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
+            ydl_call(opts, lambda y: y.extract_info(url, download=True))
             return _largest_media_file(workdir)
         except Exception as e:
             last = e
             for f in os.listdir(workdir):
-                try:
-                    os.remove(os.path.join(workdir, f))
-                except OSError:
-                    pass
+                _rm(os.path.join(workdir, f))
     raise last
 
 
@@ -1250,7 +1307,9 @@ def _parallel_download(session, url, out_path, total, workers, cb):
             fut.result()
 
 
-def choose_tier(src: Source) -> int:
+def choose_tier(src: Source, q: int = 0) -> int:
+    if q:
+        return q
     if src.mode == "ytdlp" and src.est:
         size, _ = src.est.get(MAX_HEIGHT, (0, 0))
         if size and size > UPLOAD_LIMIT:
@@ -1258,12 +1317,12 @@ def choose_tier(src: Source) -> int:
     return MAX_HEIGHT
 
 
-def download_media(src: Source, workdir, prog):
-    tier = choose_tier(src)
+def download_media(src: Source, workdir, prog, q=0, audio=False):
+    tier = choose_tier(src, q)
     errs = []
     if src.mode == "ytdlp":
         try:
-            return ytdlp_download(src.dl_url, workdir, src.headers, tier, prog)
+            return ytdlp_download(src.dl_url, workdir, src.headers, tier, prog, audio)
         except Exception as e:
             errs.append(f"yt-dlp: {str(e)[:150]}")
         if classify_media(src.dl_url) == "hls":
@@ -1278,10 +1337,15 @@ def download_media(src: Source, workdir, prog):
         except Exception as e:
             errs.append(f"direct: {str(e)[:150]}")
         try:
-            return ytdlp_download(src.dl_url, workdir, src.headers, tier, prog)
+            return ytdlp_download(src.dl_url, workdir, src.headers, tier, prog, audio)
         except Exception as e:
             errs.append(f"yt-dlp: {str(e)[:150]}")
     raise RuntimeError(" | ".join(errs) or "download fail")
+
+
+def _pixels(path):
+    inf = ffprobe(path)
+    return (inf["width"] * inf["height"]) if inf else 0
 
 
 def fetch_thumbnail(job: Job):
@@ -1289,58 +1353,68 @@ def fetch_thumbnail(job: Job):
         return job.thumb_path
     s = job.src
     sess = make_session(make_headers(s.page_url), s.cookies)
-    for u in s.thumbs[:8]:
+    best, bpx = None, -1
+    for i, u in enumerate(s.thumbs[:8]):
         try:
             r = sess.get(u, timeout=20, headers={"Accept": "image/*,*/*"})
             ct = (r.headers.get("content-type") or "").lower()
             if r.status_code != 200 or not ct.startswith("image/") or len(r.content) < 6 * 1024:
                 continue
-            ext = ".png" if "png" in ct else ".jpg" if ("jpeg" in ct or "jpg" in ct) else ".img"
-            raw = os.path.join(THUMB_DIR, f"{job.id}_src{ext}")
+            ext = ".png" if "png" in ct else ".webp" if "webp" in ct else ".jpg" if ("jpeg" in ct or "jpg" in ct) else ".img"
+            raw = os.path.join(THUMB_DIR, f"{job.id}_c{i}{ext}")
             with open(raw, "wb") as f:
                 f.write(r.content)
             if ext == ".img":
-                out = os.path.join(THUMB_DIR, f"{job.id}_src.jpg")
+                out = os.path.join(THUMB_DIR, f"{job.id}_c{i}.jpg")
                 subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", raw, "-q:v", "2", out],
                                capture_output=True, timeout=60)
-                os.remove(raw)
+                _rm(raw)
                 if not os.path.exists(out):
                     continue
                 raw = out
-            job.thumb_path = raw
-            return raw
+            px = _pixels(raw)
+            if px > bpx:
+                if best:
+                    _rm(best)
+                best, bpx = raw, px
+            else:
+                _rm(raw)
         except Exception:
             continue
     hq = os.path.join(THUMB_DIR, f"{job.id}_hq.jpg")
-    if os.path.exists(hq):
-        job.thumb_path = hq
-        return hq
-    try:
-        h = dict(s.headers)
-        if grab_frame(s.dl_url, hq, at=max(1, (s.duration or 30) * 0.1), headers=h):
-            job.thumb_path = hq
-            return hq
-    except Exception:
-        pass
-    return None
+    if bpx < 900_000:
+        if not os.path.exists(hq):
+            try:
+                grab_frame(s.dl_url, hq, at=max(1, (s.duration or 30) * 0.1), headers=dict(s.headers))
+            except Exception:
+                pass
+        if os.path.exists(hq) and _pixels(hq) > bpx:
+            best = hq
+    if best:
+        job.thumb_path = best
+    return best
 
 
 MODE_LABEL = {"exact": "🎯 Exact (frame-exact)", "fast": "⚡ Fast (keyframe)"}
 
 
-def quality_label(src: Source) -> str:
-    h = 0
-    if src.mode == "ytdlp" and src.est:
-        h = src.est.get(choose_tier(src), (0, 0))[1]
-    return f"{(h or src.height)}p" if (h or src.height) else "Best available"
+def quality_label(job: Job) -> str:
+    s = job.src
+    t = choose_tier(s, job.q)
+    h = s.est.get(t, (0, 0))[1] if s.mode == "ytdlp" and s.est else 0
+    if h:
+        return f"{h}p"
+    if job.q:
+        return f"≤{job.q}p"
+    return f"{s.height}p" if s.height else "Best available"
 
 
 def card_text(job: Job) -> str:
     s = job.src
     lines = [f"🎬 <b>{esc(s.title[:120])}</b>", ""]
     lines.append(f"⏱ Length: <code>{fmt_dur(s.duration) if s.duration else 'unknown'}</code>")
-    lines.append(f"📺 Quality: <code>{quality_label(s)}</code>")
-    sz = (s.est.get(choose_tier(s), (0, 0))[0] if s.est else 0) or s.size
+    lines.append(f"📺 Quality: <code>{quality_label(job)}</code>")
+    sz = (s.est.get(choose_tier(s, job.q), (0, 0))[0] if s.est else 0) or s.size
     if sz:
         lines.append(f"📦 Size: <code>~{humanbytes(sz)}</code>")
     lines.append("\n👇 <b>Kya karna hai?</b>")
@@ -1349,10 +1423,16 @@ def card_text(job: Job) -> str:
 
 def card_kb(job: Job) -> InlineKeyboardMarkup:
     d = fmt_dur(job.src.duration) if job.src.duration else "?"
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton(f"⬇️ Download  •  ⏱ {d}", callback_data=f"dl:{job.id}")],
         [InlineKeyboardButton(f"✂️ Cut + Download  •  ⏱ {d}", callback_data=f"cut:{job.id}")],
-    ])
+    ]
+    extra = [InlineKeyboardButton("🎵 Audio", callback_data=f"au:{job.id}")]
+    if job.src.mode == "ytdlp" and job.src.formats:
+        extra.append(InlineKeyboardButton(f"📺 Quality: {f'{job.q}p' if job.q else 'Auto'}",
+                                          callback_data=f"qu:{job.id}"))
+    rows.append(extra)
+    return InlineKeyboardMarkup(rows)
 
 
 def push(job: Job, d):
@@ -1398,17 +1478,17 @@ def thumb_kb(job: Job, seconds) -> InlineKeyboardMarkup:
         f"🖼 Thumbnail  •  ⏱ {fmt_dur(seconds)}", callback_data=f"th:{job.id}")]])
 
 
-def stage_a(job: Job, cut, workdir, prog: Progress):
+def stage_a(job: Job, cut, workdir, prog: Progress, audio=False):
     src = job.src
-    path = download_media(src, workdir, prog)
+    path = download_media(src, workdir, prog, job.q, audio)
+    if audio:
+        out, ainfo = extract_audio(path, os.path.join(workdir, "audio.m4a"), src.title,
+                                   lambda c, t: prog.update("🎵 Converting", c, t, "time"))
+        return {"audio": out, "info": ainfo, "dur": ainfo.get("duration") or src.duration, "cut": None}
     path = ensure_compatible(path, lambda c, t: prog.update("🔧 Converting", c, t, "time"))
     info = ffprobe(path) or {}
     D = info.get("duration") or src.duration or 0
-    try:
-        grab_frame(path, os.path.join(THUMB_DIR, f"{job.id}_hq.jpg"), at=max(1, D * 0.1))
-    except Exception:
-        pass
-    out = {"full": path, "info": info, "dur": D, "cut": None}
+    out = {"full": path, "info": info, "dur": D, "cut": None, "audio": None}
     if cut:
         start, end, mode = cut
         end = min(end, D) if D else end
@@ -1419,6 +1499,12 @@ def stage_a(job: Job, cut, workdir, prog: Progress):
         fitted, method = fit_to_limit(raw, os.path.join(workdir, "cut_fit.mp4"), prog)
         out["cut"] = {"path": fitted, "start": start, "end": end, "mode": used, "method": method,
                       "info": ffprobe(fitted) or {}}
+    final = out["cut"]["path"] if out["cut"] else path
+    fdur = (out["cut"]["info"].get("duration") if out["cut"] else D) or D
+    try:
+        grab_frame(final, os.path.join(THUMB_DIR, f"{job.id}_hq.jpg"), at=max(1, fdur * 0.1))
+    except Exception:
+        pass
     return out
 
 
@@ -1435,7 +1521,17 @@ def make_caption(name, info, size, extra=""):
             f"📦 <b>Size:</b> <code>{humanbytes(size)}</code>{extra}")[:1000]
 
 
-async def send_one(client, chat_id, path, fname, caption, info, kb, prog, label, workdir):
+async def valid_reply(client, chat_id, mid):
+    if not mid:
+        return None
+    try:
+        m = await client.get_messages(chat_id, mid)
+        return None if (not m or getattr(m, "empty", False)) else mid
+    except Exception:
+        return mid
+
+
+async def send_one(client, chat_id, path, fname, caption, info, kb, prog, label, workdir, reply=None):
     thumb = os.path.join(workdir, f"{label}_thumb.jpg")
     loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(
@@ -1444,6 +1540,7 @@ async def send_one(client, chat_id, path, fname, caption, info, kb, prog, label,
         chat_id=chat_id, video=path, caption=caption, file_name=fname, supports_streaming=True,
         duration=int(info.get("duration") or 0), width=int(info.get("width") or 0),
         height=int(info.get("height") or 0), thumb=thumb if ok else None, reply_markup=kb,
+        reply_to_message_id=reply,
         progress=_up_progress, progress_args=(prog, f"📤 Uploading ({label})"),
     )
 
@@ -1452,7 +1549,7 @@ async def _up_progress(current, total, prog, label):
     prog.update(label, current, total)
 
 
-async def run_delivery(client, job: Job, cut):
+async def run_delivery(client, job: Job, cut, audio=False):
     global active_downloads
     loop = asyncio.get_running_loop()
     job.busy = True
@@ -1468,12 +1565,21 @@ async def run_delivery(client, job: Job, cut):
             active_downloads += 1
             try:
                 await prog.stage("Starting…")
-                res = await loop.run_in_executor(None, stage_a, job, cut, workdir, prog)
+                res = await loop.run_in_executor(None, stage_a, job, cut, workdir, prog, audio)
                 base = sanitize_filename(
                     (name_from_url(job.src.dl_url) if job.src.use_url_name else job.src.title) or "video")
-                dur = res["dur"]
+                reply = await valid_reply(client, job.chat_id, job.reply_to)
 
-                if res["cut"]:
+                if res.get("audio"):
+                    apath = res["audio"]
+                    cap = (f"🎵 <b>Audio</b>\n\n🎬 <b>Name:</b> <code>{esc(base)}</code>\n"
+                           f"⏱ <b>Length:</b> <code>{fmt_dur(res['dur'])}</code>\n"
+                           f"📦 <b>Size:</b> <code>{humanbytes(os.path.getsize(apath))}</code>")
+                    await client.send_audio(
+                        chat_id=job.chat_id, audio=apath, caption=cap, file_name=f"{base}.m4a",
+                        duration=int(res["dur"] or 0), title=base[:60], reply_to_message_id=reply,
+                        progress=_up_progress, progress_args=(prog, "📤 Uploading (audio)"))
+                elif res["cut"]:
                     c = res["cut"]
                     csize = os.path.getsize(c["path"])
                     cdur = c["info"].get("duration") or (c["end"] - c["start"])
@@ -1484,22 +1590,22 @@ async def run_delivery(client, job: Job, cut):
                     fname = f"{base}_cut_{fmt_hms(c['start']).replace(':', '-')}_{fmt_hms(c['end']).replace(':', '-')}.mp4"
                     await send_one(client, job.chat_id, c["path"], fname,
                                    make_caption(base, c["info"], csize, extra), c["info"],
-                                   thumb_kb(job, cdur), prog, "cut", workdir)
-
-                full = res["full"]
-                method = "none"
-                if os.path.getsize(full) > UPLOAD_LIMIT:
-                    full, method = await loop.run_in_executor(
-                        None, fit_to_limit, full, os.path.join(workdir, "full_fit.mp4"), prog)
-                finfo = (await loop.run_in_executor(None, ffprobe, full)) or res["info"]
-                extra = ""
-                if method == "partial":
-                    extra = "\n🗜 2GB limit: sirf beech ka hissa compress hua (shuru/end original quality)"
-                elif method == "full":
-                    extra = "\n🗜 2GB limit ke liye compress hui"
-                await send_one(client, job.chat_id, full, f"{base}.mp4",
-                               make_caption(base, finfo, os.path.getsize(full), extra), finfo,
-                               thumb_kb(job, finfo.get("duration") or dur), prog, "full", workdir)
+                                   thumb_kb(job, cdur), prog, "cut", workdir, reply)
+                else:
+                    full = res["full"]
+                    method = "none"
+                    if os.path.getsize(full) > UPLOAD_LIMIT:
+                        full, method = await loop.run_in_executor(
+                            None, fit_to_limit, full, os.path.join(workdir, "full_fit.mp4"), prog)
+                    finfo = (await loop.run_in_executor(None, ffprobe, full)) or res["info"]
+                    extra = ""
+                    if method == "partial":
+                        extra = "\n🗜 2GB limit: sirf beech ka hissa compress hua (shuru/end original quality)"
+                    elif method == "full":
+                        extra = "\n🗜 2GB limit ke liye compress hui"
+                    await send_one(client, job.chat_id, full, f"{base}.mp4",
+                                   make_caption(base, finfo, os.path.getsize(full), extra), finfo,
+                                   thumb_kb(job, finfo.get("duration") or res["dur"]), prog, "full", workdir, reply)
                 try:
                     await msg.delete()
                 except Exception:
@@ -1518,7 +1624,7 @@ async def run_delivery(client, job: Job, cut):
         job.busy = False
 
 
-async def analyze_url(client, status_msg: Message, chat_id: int, url: str):
+async def analyze_url(client, status_msg: Message, chat_id: int, url: str, reply_to=None, rng=None):
     global analyzing
     short = esc(url[:60])
 
@@ -1532,10 +1638,15 @@ async def analyze_url(client, status_msg: Message, chat_id: int, url: str):
         analyzing += 1
         try:
             src = await asyncio.wait_for(resolve_source(url, status), timeout=240)
-            job = Job(id=secrets.token_hex(4), chat_id=chat_id, src=src, msg=status_msg)
+            job = Job(id=secrets.token_hex(4), chat_id=chat_id, src=src, msg=status_msg, reply_to=reply_to)
             job.ce = src.duration or 600.0
             JOBS[job.id] = job
-            await status_msg.edit_text(card_text(job), reply_markup=card_kb(job))
+            D = src.duration
+            if rng and not (D and rng[0] >= D):
+                job.cs, job.ce = rng[0], (min(rng[1], D) if D else rng[1])
+                spawn(run_delivery(client, job, (job.cs, job.ce, job.mode)))
+            else:
+                await status_msg.edit_text(card_text(job), reply_markup=card_kb(job))
         except Exception as e:
             logging.error(f"[analyze] {url}: {e}")
             await status_msg.edit_text(
@@ -1552,10 +1663,11 @@ async def start_cmd(_, message: Message):
     await message.reply_text(
         "👋 <b>Universal Video Downloader</b>\n\n"
         "🔗 Link bhejo (ek message mein kai links bhi chalenge)\n"
-        "🧠 Analyze ke baad buttons aate hain: <b>Download</b> / <b>Cut + Download</b>\n"
-        "✂️ Cut mein keypad se Start/End time daalo — chat mein <b>cut + full</b> dono videos aati hain\n"
-        "📺 Best quality (1080p/720p). 2GB se badi ho tabhi compress\n"
-        "🖼 Har video ke saath <b>Thumbnail</b> button (HQ thumbnail chahiye to dabao)\n\n"
+        "🧠 Analyze ke baad: <b>Download</b> / <b>Cut + Download</b> / <b>🎵 Audio</b> / <b>📺 Quality</b>\n"
+        "✂️ Cut mein sirf cut hui video aati hai\n"
+        "⚡ Shortcut: link ke saath time likho, jaise <code>link 1:20-2:45</code> — seedha cut ho jayega\n"
+        "↩️ Video aur thumbnail aapke link wale message ka reply banke aate hain\n"
+        "🖼 Thumbnail button: ek HD image (original quality file)\n\n"
         "⚡ Engines: yt-dlp → Browser → HTML scan → Gemini AI"
     )
 
@@ -1566,9 +1678,11 @@ async def help_cmd(_, message: Message):
         "<b>📖 Kaise use karein</b>\n\n"
         "1️⃣ Video page ka URL bhejo\n"
         "2️⃣ Bot analyze karke length ke saath buttons dega\n"
-        "3️⃣ <b>⬇️ Download</b> = sirf full video\n"
-        "4️⃣ <b>✂️ Cut</b> = keypad se Start/End time daalo, phir ✅\n"
-        "5️⃣ Video ke neeche <b>🖼 Thumbnail</b> dabao to HQ thumbnail milega\n\n"
+        "3️⃣ <b>⬇️ Download</b> = full video, <b>🎵 Audio</b> = sirf audio (m4a)\n"
+        "4️⃣ <b>✂️ Cut</b> = keypad se Start/End time daalo, phir ✅ (sirf cut video aayegi)\n"
+        "5️⃣ <b>📺 Quality</b> = Auto / 1080p / 720p / 480p\n"
+        "6️⃣ Video ke neeche <b>🖼 Thumbnail</b> dabao to HD thumbnail milega\n"
+        "7️⃣ Shortcut: <code>link 1:20-2:45</code> bhejo to seedha cut hoke aayegi\n\n"
         "<b>Cut modes:</b> 🎯 Exact (frame-exact) • ⚡ Fast (keyframe pe, instant)\n"
         "<b>Login wali sites:</b> browser se <code>cookies.txt</code> (Netscape format) bot folder mein rakho"
     )
@@ -1587,9 +1701,10 @@ async def url_handler(client, message: Message):
     urls = list(dict.fromkeys(u.rstrip(").,;]") for u in URL_REGEX.findall(text)))[:10]
     if not urls:
         return
+    rng = parse_range(URL_REGEX.sub(" ", text))
     for u in urls:
-        st = await message.reply_text(f"🔍 <b>Analyzing…</b>\n<code>{esc(u[:60])}</code>")
-        spawn(analyze_url(client, st, message.chat.id, u))
+        st = await message.reply_text(f"🔍 <b>Analyzing…</b>\n<code>{esc(u[:60])}</code>", quote=True)
+        spawn(analyze_url(client, st, message.chat.id, u, message.id, rng))
 
 
 @app.on_callback_query()
@@ -1599,23 +1714,28 @@ async def on_callback(client, cq: CallbackQuery):
     job = JOBS.get(parts[1]) if len(parts) > 1 else None
     if not job:
         return await cq.answer("⌛ Ye request purani ho gayi — link dobara bhejo.", show_alert=True)
+    chat = cq.message.chat.id
 
     if act == "th":
-        await cq.answer("🖼 Thumbnail la raha hoon…")
+        if job.thumb_sent:
+            return await cq.answer("🖼 Thumbnail pehle hi bhej di hai")
+        job.thumb_sent = True
+        await cq.answer("🖼 HD thumbnail la raha hoon…")
         loop = asyncio.get_running_loop()
         path = await loop.run_in_executor(None, fetch_thumbnail, job)
+        reply = await valid_reply(client, chat, job.reply_to)
         if not path:
-            return await client.send_message(cq.message.chat.id, "❌ Is video ka thumbnail nahi mil paaya.")
-        cap = f"🖼 <b>{esc(job.src.title[:100])}</b>"
+            job.thumb_sent = False
+            return await client.send_message(chat, "❌ Is video ka thumbnail nahi mil paaya.",
+                                             reply_to_message_id=reply)
         try:
-            await client.send_photo(cq.message.chat.id, path, caption=cap)
+            await client.send_document(
+                chat, path, caption=f"🖼 <b>{esc(job.src.title[:100])}</b>",
+                file_name=f"{sanitize_filename(job.src.title)}{os.path.splitext(path)[1] or '.jpg'}",
+                force_document=True, reply_to_message_id=reply)
         except Exception as e:
-            logging.info(f"photo send fail: {e}")
-        try:
-            await client.send_document(cq.message.chat.id, path, caption="📎 Original quality file",
-                                       force_document=True)
-        except Exception as e:
-            logging.info(f"doc send fail: {e}")
+            job.thumb_sent = False
+            logging.info(f"thumb send fail: {e}")
         return
 
     if job.busy:
@@ -1630,6 +1750,17 @@ async def on_callback(client, cq: CallbackQuery):
     if act == "dl":
         await cq.answer("⬇️ Shuru ho gaya…")
         return spawn(run_delivery(client, job, None))
+    if act == "au":
+        await cq.answer("🎵 Audio shuru ho gaya…")
+        return spawn(run_delivery(client, job, None, True))
+    if act == "qu":
+        i = QUALITIES.index(job.q) if job.q in QUALITIES else 0
+        job.q = QUALITIES[(i + 1) % len(QUALITIES)]
+        await cq.answer()
+        try:
+            return await cq.message.edit_text(card_text(job), reply_markup=card_kb(job))
+        except Exception:
+            return
     if act == "cx":
         await cq.answer()
         return await cq.message.edit_text(card_text(job), reply_markup=card_kb(job))
@@ -1667,10 +1798,7 @@ async def janitor():
                 JOBS.pop(jid, None)
                 for f in os.listdir(THUMB_DIR):
                     if f.startswith(jid + "_"):
-                        try:
-                            os.remove(os.path.join(THUMB_DIR, f))
-                        except OSError:
-                            pass
+                        _rm(os.path.join(THUMB_DIR, f))
         for d in os.listdir(DOWNLOAD_DIR):
             p = os.path.join(DOWNLOAD_DIR, d)
             if os.path.isdir(p) and now - os.path.getmtime(p) > 4 * 3600:
