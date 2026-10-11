@@ -45,10 +45,9 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 2))
 MiB = 1024 * 1024
 UPLOAD_LIMIT = int(os.environ.get("UPLOAD_LIMIT_MB", 1990)) * MiB
 COMPRESS_TARGET = int(os.environ.get("COMPRESS_TARGET_MB", 1900)) * MiB
-MAX_HEIGHT = 1080
+MAX_HEIGHT = 4320
 FALLBACK_HEIGHT = 720
-TIERS = (MAX_HEIGHT, FALLBACK_HEIGHT, 480)
-QUALITIES = (0,) + TIERS
+TIERS = (MAX_HEIGHT, FALLBACK_HEIGHT)
 COOKIES_FILE = "cookies.txt"
 
 DOWNLOAD_DIR = "./downloads/"
@@ -170,6 +169,15 @@ def humanbytes(size) -> str:
             return f"{size:.2f} {unit}"
         size /= 1024.0
     return f"{size:.2f} TB"
+
+
+def short_bytes(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024.0:
+            return f"{n:.0f} {unit}" if (n >= 100 or unit in ("B", "KB")) else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} TB"
 
 
 def fmt_dur(sec) -> str:
@@ -1398,40 +1406,40 @@ def fetch_thumbnail(job: Job):
 MODE_LABEL = {"exact": "🎯 Exact (frame-exact)", "fast": "⚡ Fast (keyframe)"}
 
 
-def quality_label(job: Job) -> str:
-    s = job.src
-    t = choose_tier(s, job.q)
-    h = s.est.get(t, (0, 0))[1] if s.mode == "ytdlp" and s.est else 0
-    if h:
-        return f"{h}p"
-    if job.q:
-        return f"≤{job.q}p"
-    return f"{s.height}p" if s.height else "Best available"
+def quality_options(s: Source) -> list:
+    if s.mode == "ytdlp" and s.est:
+        sb, hb = s.est.get(MAX_HEIGHT, (0, 0))
+        s7, h7 = s.est.get(FALLBACK_HEIGHT, (0, 0))
+        if hb:
+            opts = [(MAX_HEIGHT, hb, sb)]
+            if h7 and h7 < hb:
+                opts.append((FALLBACK_HEIGHT, h7, s7))
+            return opts
+    return [(MAX_HEIGHT, s.height, s.size)]
+
+
+def dl_label(h, size, only) -> str:
+    t = f"{h}p" if h else ("" if only else "Best")
+    z = f"~{short_bytes(size)}" if size else ""
+    return "⬇️ " + " • ".join(x for x in (("Download" if only else ""), t, z) if x)
 
 
 def card_text(job: Job) -> str:
     s = job.src
     lines = [f"🎬 <b>{esc(s.title[:120])}</b>", ""]
     lines.append(f"⏱ Length: <code>{fmt_dur(s.duration) if s.duration else 'unknown'}</code>")
-    lines.append(f"📺 Quality: <code>{quality_label(job)}</code>")
-    sz = (s.est.get(choose_tier(s, job.q), (0, 0))[0] if s.est else 0) or s.size
-    if sz:
-        lines.append(f"📦 Size: <code>~{humanbytes(sz)}</code>")
     lines.append("\n👇 <b>Kya karna hai?</b>")
     return "\n".join(lines)
 
 
 def card_kb(job: Job) -> InlineKeyboardMarkup:
-    d = fmt_dur(job.src.duration) if job.src.duration else "?"
-    rows = [
-        [InlineKeyboardButton(f"⬇️ Download  •  ⏱ {d}", callback_data=f"dl:{job.id}")],
-        [InlineKeyboardButton(f"✂️ Cut + Download  •  ⏱ {d}", callback_data=f"cut:{job.id}")],
-    ]
-    extra = [InlineKeyboardButton("🎵 Audio", callback_data=f"au:{job.id}")]
-    if job.src.mode == "ytdlp" and job.src.formats:
-        extra.append(InlineKeyboardButton(f"📺 Quality: {f'{job.q}p' if job.q else 'Auto'}",
-                                          callback_data=f"qu:{job.id}"))
-    rows.append(extra)
+    s = job.src
+    d = fmt_dur(s.duration) if s.duration else "?"
+    opts = quality_options(s)
+    rows = [[InlineKeyboardButton(dl_label(h, z, len(opts) == 1), callback_data=f"dl:{job.id}:{q}")]
+            for q, h, z in opts]
+    rows.append([InlineKeyboardButton(f"✂️ Cut + Download  •  ⏱ {d}", callback_data=f"cut:{job.id}")])
+    rows.append([InlineKeyboardButton("🎵 Audio", callback_data=f"au:{job.id}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1468,6 +1476,8 @@ def panel_kb(job: Job) -> InlineKeyboardMarkup:
         kp("1", "2", "3"), kp("4", "5", "6"), kp("7", "8", "9"),
         [b("00", f"cd:{i}:00"), b("0", f"cd:{i}:0"), b("⌫", f"cb:{i}")],
         [b("🗑 Clear", f"cc:{i}"), b("⏩ End=Full", f"cf:{i}"), b(MODE_LABEL[job.mode].split(" (")[0], f"cm:{i}")],
+    ] + ([[b(f"📺 Quality: {'720p' if job.q == FALLBACK_HEIGHT else 'Best'}", f"cq:{i}")]]
+         if len(quality_options(job.src)) > 1 else []) + [
         [b("✅ Cut + Download", f"cg:{i}")],
         [b("⬅️ Back", f"cx:{i}")],
     ])
@@ -1663,7 +1673,7 @@ async def start_cmd(_, message: Message):
     await message.reply_text(
         "👋 <b>Universal Video Downloader</b>\n\n"
         "🔗 Link bhejo (ek message mein kai links bhi chalenge)\n"
-        "🧠 Analyze ke baad: <b>Download</b> / <b>Cut + Download</b> / <b>🎵 Audio</b> / <b>📺 Quality</b>\n"
+        "🧠 Analyze ke baad: <b>⬇️ 1080p+ / 720p</b> (size ke saath) / <b>Cut + Download</b> / <b>🎵 Audio</b>\n"
         "✂️ Cut mein sirf cut hui video aati hai\n"
         "⚡ Shortcut: link ke saath time likho, jaise <code>link 1:20-2:45</code> — seedha cut ho jayega\n"
         "↩️ Video aur thumbnail aapke link wale message ka reply banke aate hain\n"
@@ -1678,9 +1688,9 @@ async def help_cmd(_, message: Message):
         "<b>📖 Kaise use karein</b>\n\n"
         "1️⃣ Video page ka URL bhejo\n"
         "2️⃣ Bot analyze karke length ke saath buttons dega\n"
-        "3️⃣ <b>⬇️ Download</b> = full video, <b>🎵 Audio</b> = sirf audio (m4a)\n"
+        "3️⃣ <b>⬇️ 1080p+</b> ya <b>⬇️ 720p</b> = full video (size button par likha hota hai), <b>🎵 Audio</b> = sirf audio (m4a)\n"
         "4️⃣ <b>✂️ Cut</b> = keypad se Start/End time daalo, phir ✅ (sirf cut video aayegi)\n"
-        "5️⃣ <b>📺 Quality</b> = Auto / 1080p / 720p / 480p\n"
+        "5️⃣ Cut panel mein <b>📺 Quality</b> = Best / 720p\n"
         "6️⃣ Video ke neeche <b>🖼 Thumbnail</b> dabao to HD thumbnail milega\n"
         "7️⃣ Shortcut: <code>link 1:20-2:45</code> bhejo to seedha cut hoke aayegi\n\n"
         "<b>Cut modes:</b> 🎯 Exact (frame-exact) • ⚡ Fast (keyframe pe, instant)\n"
@@ -1748,19 +1758,13 @@ async def on_callback(client, cq: CallbackQuery):
             pass
 
     if act == "dl":
+        if len(parts) > 2 and parts[2].isdigit():
+            job.q = int(parts[2])
         await cq.answer("⬇️ Shuru ho gaya…")
         return spawn(run_delivery(client, job, None))
     if act == "au":
         await cq.answer("🎵 Audio shuru ho gaya…")
         return spawn(run_delivery(client, job, None, True))
-    if act == "qu":
-        i = QUALITIES.index(job.q) if job.q in QUALITIES else 0
-        job.q = QUALITIES[(i + 1) % len(QUALITIES)]
-        await cq.answer()
-        try:
-            return await cq.message.edit_text(card_text(job), reply_markup=card_kb(job))
-        except Exception:
-            return
     if act == "cx":
         await cq.answer()
         return await cq.message.edit_text(card_text(job), reply_markup=card_kb(job))
@@ -1785,6 +1789,8 @@ async def on_callback(client, cq: CallbackQuery):
         job.ce = job.src.duration or job.ce
     elif act == "cm":
         job.mode = "fast" if job.mode == "exact" else "exact"
+    elif act == "cq":
+        job.q = MAX_HEIGHT if job.q == FALLBACK_HEIGHT else FALLBACK_HEIGHT
     await cq.answer()
     await refresh()
 
