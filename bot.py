@@ -1,23 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Universal Video Downloader Bot  (v12)
-=====================================
-Flow:
-  1. Link bhejo  ->  bot analyze karta hai (yt-dlp -> browser sniff -> HTML scan -> Gemini)
-  2. Analysis ke BAAD buttons aate hain:  [⬇️ Download • ⏱ length]  [✂️ Cut + Download • ⏱ length]
-  3. Cut panel: Start/End ko +/- buttons se set karo (ya type karo: 1:30-5:45)
-  4. Chat mein 2 videos aati hain: ✂️ cut wali + 🎬 full wali (har video pe 🖼 Thumbnail button)
-
-Quality rules:
-  * Default best quality, max 1080p (720p se kam nahi, jab tak site khud na de)
-  * Size > 2GB estimate ho  -> chup-chap 720p
-  * Phir bhi > 2GB          -> sirf beech ka hissa compress (shuru/end original quality)
-  * 2GB se chhoti file ko kabhi compress nahi karta
-
-Requirements: ffmpeg + ffprobe (system), pip: pyrogram tgcrypto yt-dlp cloudscraper
-              playwright google-generativeai  (optional: curl_cffi for Cloudflare sites)
-"""
 import os
 import re
 import json
@@ -35,6 +15,13 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from urllib.parse import urlparse, urljoin, unquote
 
+import sys
+if os.environ.get("AUTO_UPDATE", "1") == "1":
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-U", "-q", "yt-dlp[default]", "curl_cffi"],
+                       capture_output=True, timeout=150)
+    except Exception:
+        pass
 import yt_dlp
 import cloudscraper
 from pyrogram import Client, filters, enums, idle
@@ -45,12 +32,9 @@ from playwright.async_api import async_playwright
 
 try:
     import google.generativeai as genai
-except Exception:  # optional
+except Exception:
     genai = None
 
-# ==========================================
-# 1. CONFIG
-# ==========================================
 API_ID = int(os.environ.get("API_ID", 0) or 0)
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -59,8 +43,8 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 2))
 MiB = 1024 * 1024
-UPLOAD_LIMIT = int(os.environ.get("UPLOAD_LIMIT_MB", 1990)) * MiB      # isse upar = compress
-COMPRESS_TARGET = int(os.environ.get("COMPRESS_TARGET_MB", 1900)) * MiB  # compress ke baad target
+UPLOAD_LIMIT = int(os.environ.get("UPLOAD_LIMIT_MB", 1990)) * MiB
+COMPRESS_TARGET = int(os.environ.get("COMPRESS_TARGET_MB", 1900)) * MiB
 MAX_HEIGHT = 1080
 FALLBACK_HEIGHT = 720
 COOKIES_FILE = "cookies.txt"
@@ -82,7 +66,7 @@ try:
         "video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
         parse_mode=enums.ParseMode.HTML, max_concurrent_transmissions=4,
     )
-except TypeError:  # purana pyrogram
+except TypeError:
     app = Client(
         "video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
         parse_mode=enums.ParseMode.HTML,
@@ -99,9 +83,7 @@ if GEMINI_API_KEY and genai:
 else:
     logging.warning("⚠️ Gemini disabled (key/lib missing) — baaki engines chalenge")
 
-# ---- global state ----
-JOBS = {}          # job_id -> Job
-ACTIVE_CUT = {}    # chat_id -> job_id (jiska cut panel khula hai)
+JOBS = {}
 ANALYZE_SEM = None
 DL_SEM = None
 active_downloads = 0
@@ -117,9 +99,6 @@ def spawn(coro):
     return t
 
 
-# ==========================================
-# 2. SITE CONFIG
-# ==========================================
 SITE_SELECTORS = {
     "rule34video.com": {
         "download_selectors": [
@@ -173,9 +152,6 @@ def get_site_config(url: str) -> dict:
     return SITE_SELECTORS["default"]
 
 
-# ==========================================
-# 3. SMALL HELPERS
-# ==========================================
 def esc(s) -> str:
     return html.escape(str(s or ""), quote=False)
 
@@ -205,29 +181,6 @@ def fmt_hms(sec) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-_T = r'(?:\d+:\d{1,2}(?::\d{1,2})?(?:\.\d+)?|\d+h(?:\d+m)?(?:\d+s)?|\d+m(?:\d+s)?|\d+(?:\.\d+)?s?)'
-RANGE_RE = re.compile(rf'^\s*({_T})\s*(?:-|–|—|→|to|,)\s*({_T})\s*$', re.I)
-
-
-def parse_time(tok: str):
-    tok = (tok or "").strip().lower()
-    if not tok:
-        return None
-    try:
-        if ":" in tok:
-            sec = 0.0
-            for p in tok.split(":"):
-                sec = sec * 60 + float(p)
-            return sec
-        m = re.fullmatch(r'(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s?)?', tok)
-        if not m or not any(m.groups()):
-            return None
-        h, mi, s = m.groups()
-        return int(h or 0) * 3600 + int(mi or 0) * 60 + float(s or 0)
-    except Exception:
-        return None
-
-
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name or "")
     name = re.sub(r'\s+', ' ', name).strip(" .")
@@ -248,7 +201,6 @@ def is_bad_url(u: str) -> bool:
 
 
 def classify_media(url: str, ctype: str = "", total: int = 0):
-    """'hls' | 'dash' | 'mp4' | None   (segments ko ignore karta hai)"""
     p = url_path(url)
     ctype = (ctype or "").lower()
     if "mp2t" in ctype or "iso.segment" in ctype:
@@ -337,23 +289,19 @@ def make_session(headers: dict, cookies: list):
 
 @lru_cache(maxsize=1)
 def impersonate_target():
-    """curl_cffi installed ho to yt-dlp Cloudflare wali sites par browser jaisa banega."""
     try:
-        import curl_cffi  # noqa: F401
+        import curl_cffi
         from yt_dlp.networking.impersonate import ImpersonateTarget
         return ImpersonateTarget.from_str("chrome")
     except Exception:
         return None
 
 
-# ==========================================
-# 4. DATA MODELS
-# ==========================================
 @dataclass
 class Source:
     page_url: str
     dl_url: str
-    mode: str                       # 'ytdlp' | 'direct'
+    mode: str
     headers: dict
     cookies: list
     title: str = "video"
@@ -361,7 +309,7 @@ class Source:
     height: int = 0
     size: int = 0
     formats: list = field(default_factory=list)
-    est: dict = field(default_factory=dict)      # {1080: (bytes, height), 720: (...)}
+    est: dict = field(default_factory=dict)
     thumbs: list = field(default_factory=list)
     use_url_name: bool = False
 
@@ -375,15 +323,13 @@ class Job:
     created: float = field(default_factory=time.time)
     cs: float = 0.0
     ce: float = 0.0
-    sel: str = "s"                  # panel mein kaunsa field edit ho raha hai
-    mode: str = "auto"              # auto | fast | accurate
+    sel: str = "s"
+    mode: str = "exact"
+    fresh: bool = True
     busy: bool = False
     thumb_path: str = ""
 
 
-# ==========================================
-# 5. MEDIA TOOLS (ffprobe / ffmpeg)
-# ==========================================
 def ffprobe(target, headers=None, timeout=40):
     cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams"]
     if str(target).startswith("http"):
@@ -480,7 +426,6 @@ def grab_frame(src, out_jpg, at=5.0, headers=None, width=None, quality=2):
 
 
 def ensure_compatible(path, on_progress=None):
-    """Telegram ke liye mp4 + h264(yuv420p) + aac. Zaroorat ho tabhi convert."""
     info = ffprobe(path)
     if not info:
         raise RuntimeError("Downloaded file invalid hai (ffprobe fail)")
@@ -505,34 +450,73 @@ def ensure_compatible(path, on_progress=None):
     return out
 
 
-def cut_video(src, dst, start, end, mode="auto", on_progress=None):
-    """Returns actual mode used: 'fast' (stream copy) ya 'accurate' (re-encode)."""
-    dur = max(0.5, end - start)
-    if mode == "auto":
-        mode = "accurate" if dur <= 300 else "fast"
+def _audio_args(info):
+    if not info["acodec"]:
+        return ["-an"], ["-an"]
+    enc = ["-c:a", "aac", "-b:a", "128k"]
+    extra = (["-ar", str(info["ar"])] if info["ar"] else []) + (["-ac", str(info["ch"])] if info["ch"] else [])
+    return (["-c:a", "copy"] if info["acodec"] == "aac" else enc + extra), enc + extra
+
+
+def _concat_ts(parts, dst, has_a, D):
+    lst = dst + ".list.txt"
+    with open(lst, "w") as f:
+        for p in parts:
+            f.write("file '" + os.path.abspath(p).replace("'", "'\\''") + "'\n")
+    bsf = ["-bsf:a", "aac_adtstoasc"] if has_a else []
+    try:
+        run_ffmpeg(["-f", "concat", "-safe", "0", "-i", lst, "-map", "0", "-c", "copy"] + bsf +
+                   ["-movflags", "+faststart", dst], D)
+    finally:
+        for p in parts + [lst]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def smart_cut(src, dst, start, end, info, cb=None):
+    dur = end - start
+    a_copy, a_enc = _audio_args(info)
     maps = ["-map", "0:v:0", "-map", "0:a:0?"]
+    enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-pix_fmt", "yuv420p"] + a_enc
+    prog = (lambda c, t: cb.update("✂️ Cutting", c, t, "time")) if cb else None
+    kfs = keyframe_times(src) if info["vcodec"] == "h264" and dur > 40 else []
+    k1 = next((k for k in kfs if k >= start), None)
+    k2 = max((k for k in kfs if k <= end), default=None)
+    if k1 is None or k2 is None or k2 - k1 < 6:
+        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}"] + maps + enc +
+                   ["-movflags", "+faststart", dst], dur, prog)
+        return
+    work = os.path.dirname(dst) or "."
+    a, b, c = (os.path.join(work, n) for n in ("cut_a.ts", "cut_b.ts", "cut_c.ts"))
+    parts = []
+    if k1 - start > 0.05:
+        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{k1 - start:.3f}"] + maps + enc + ["-f", "mpegts", a])
+        parts.append(a)
+    run_ffmpeg(["-ss", f"{k1 + 0.005:.3f}", "-i", src, "-t", f"{k2 - k1:.3f}"] + maps +
+               ["-c:v", "copy"] + a_copy + ["-f", "mpegts", b], k2 - k1, prog)
+    parts.append(b)
+    if end - k2 > 0.05:
+        run_ffmpeg(["-ss", f"{k2:.3f}", "-i", src, "-t", f"{end - k2:.3f}"] + maps + enc + ["-f", "mpegts", c])
+        parts.append(c)
+    _concat_ts(parts, dst, bool(info["acodec"]), dur)
+
+
+def cut_video(src, dst, start, end, mode, info, cb=None):
+    dur = max(0.5, end - start)
     if mode == "fast":
-        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}"] + maps +
-                   ["-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", dst],
-                   dur, on_progress)
-        info = ffprobe(dst)
-        if info and info["duration"] >= dur * 0.5:
+        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}", "-map", "0:v:0", "-map", "0:a:0?",
+                    "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", dst],
+                   dur, (lambda c, t: cb.update("✂️ Cutting", c, t, "time")) if cb else None)
+        out = ffprobe(dst)
+        if out and out["duration"] >= dur * 0.5:
             return "fast"
-        mode = "accurate"       # copy ne kharab output diya -> re-encode
-    run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}"] + maps +
-               ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", dst],
-               dur, on_progress)
-    return "accurate"
+    smart_cut(src, dst, start, end, info, cb)
+    return "exact"
 
 
-# ----------------- compression (sirf zaroorat par, sirf beech ka hissa) -----------------
 def compress_to_fit(src, dst, target, on_progress=None):
-    """
-    File ko `target` bytes ke andar lata hai. Returns 'partial' | 'full'.
-    PARTIAL: shuru + end original (stream copy), sirf beech ka utna hissa re-encode
-             jitna size girane ke liye zaroori ho. Fail ho to FULL (poori video, ek saath).
-    """
     info = ffprobe(src)
     if not info or info["duration"] <= 0:
         raise RuntimeError("Compress: duration nahi mili")
@@ -607,44 +591,18 @@ def _compress_partial(src, dst, info, target, cb):
 
 def _build_spliced(src, dst, info, k1, k2, vm, work, cb):
     has_a = bool(info["acodec"])
-    audio_copy = info["acodec"] == "aac"
     head, mid, tail = (os.path.join(work, n) for n in ("seg_head.ts", "seg_mid.ts", "seg_tail.ts"))
-    lst = os.path.join(work, "seg_list.txt")
-    if not has_a:
-        a_copy, a_enc = ["-an"], ["-an"]
-    else:
-        a_copy = ["-c:a", "copy"] if audio_copy else ["-c:a", "aac", "-b:a", "128k"]
-        a_enc = ["-c:a", "aac", "-b:a", "128k"]
-        if info["ar"]:
-            a_enc += ["-ar", str(info["ar"])]
-            if not audio_copy:
-                a_copy += ["-ar", str(info["ar"])]
-        if info["ch"]:
-            a_enc += ["-ac", str(info["ch"])]
-            if not audio_copy:
-                a_copy += ["-ac", str(info["ch"])]
+    a_copy, a_enc = _audio_args(info)
     maps = ["-map", "0:v:0", "-map", "0:a:0?"]
     D = info["duration"]
-    # head & tail: original quality (stream copy)
     run_ffmpeg(["-i", src, "-t", f"{k1:.3f}"] + maps + ["-c:v", "copy"] + a_copy + ["-f", "mpegts", head])
     run_ffmpeg(["-ss", f"{k2 + 0.005:.3f}", "-i", src] + maps + ["-c:v", "copy"] + a_copy + ["-f", "mpegts", tail])
-    # middle: re-encode
     vb = int(vm)
     run_ffmpeg(["-ss", f"{k1:.3f}", "-i", src, "-t", f"{k2 - k1:.3f}"] + maps +
                ["-c:v", "libx264", "-preset", "veryfast", "-b:v", str(vb), "-maxrate", str(int(vb * 1.3)),
                 "-bufsize", str(vb * 2), "-pix_fmt", "yuv420p"] + a_enc + ["-f", "mpegts", mid],
                k2 - k1, (lambda c, t: cb.update("🗜 Compressing (beech ka hissa)", c, t, "time")) if cb else None)
-    with open(lst, "w") as f:
-        for p in (head, mid, tail):
-            f.write("file '" + os.path.abspath(p).replace("'", "'\\''") + "'\n")
-    bsf = ["-bsf:a", "aac_adtstoasc"] if has_a else []
-    run_ffmpeg(["-f", "concat", "-safe", "0", "-i", lst, "-map", "0", "-c", "copy"] + bsf +
-               ["-movflags", "+faststart", dst], D)
-    for p in (head, mid, tail, lst):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
+    _concat_ts([head, mid, tail], dst, has_a, D)
 
 
 def _compress_full(src, dst, info, target, cb):
@@ -668,9 +626,6 @@ def _compress_full(src, dst, info, target, cb):
     raise RuntimeError("Compress ke baad bhi file 2GB se badi hai")
 
 
-# ==========================================
-# 6. PROGRESS (thread-safe message updater)
-# ==========================================
 class Progress:
     def __init__(self, loop, msg, header=""):
         self.loop, self.msg, self.header = loop, msg, header
@@ -708,15 +663,12 @@ class Progress:
             pass
 
 
-# ==========================================
-# 7. EXTRACTION
-# ==========================================
-def base_ydl_opts(headers=None):
+def base_ydl_opts(headers=None, fast=False):
     h = dict(headers or {})
     h.setdefault("User-Agent", UA)
     o = {
         "quiet": True, "no_warnings": True, "noplaylist": True, "nocheckcertificate": True,
-        "socket_timeout": 30, "retries": 5, "fragment_retries": 10, "http_headers": h,
+        "socket_timeout": 10 if fast else 30, "retries": 1 if fast else 5, "fragment_retries": 10, "http_headers": h,
     }
     if os.path.exists(COOKIES_FILE):
         o["cookiefile"] = COOKIES_FILE
@@ -727,7 +679,7 @@ def base_ydl_opts(headers=None):
 
 
 def ytdlp_extract(url, headers=None):
-    opts = base_ydl_opts(headers)
+    opts = base_ydl_opts(headers, True)
     opts.update({"skip_download": True})
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -742,7 +694,6 @@ def compact_formats(info):
 
 
 def est_size(formats, duration, max_h):
-    """(estimated_bytes, height) — max_h tak ka best video + best audio."""
     def fsize(f):
         s = f.get("filesize") or f.get("filesize_approx")
         if s:
@@ -832,10 +783,9 @@ def scan_html_for_media(text, base):
 
 
 async def sniff_page(page_url, cookies):
-    """Headless browser se network + DOM scan. Returns dict(cands, title, thumbs, cookies, html)."""
     cfg = get_site_config(page_url)
     cands, seen = {}, set()
-    res = {"cands": [], "title": None, "thumbs": [], "cookies": [], "html": ""}
+    res = {"cands": [], "title": None, "thumbs": [], "cookies": [], "html": "", "frames": []}
 
     def add(url, score, kind, size=0, tag=""):
         if not url or not url.startswith("http") or is_image_url(url) or is_bad_url(url):
@@ -917,7 +867,7 @@ async def sniff_page(page_url, cookies):
 
             page = await ctx.new_page()
             page.on("response", on_response)
-            ctx.on("page", lambda pg: asyncio.ensure_future(pg.close()))   # popup ads band
+            ctx.on("page", lambda pg: asyncio.ensure_future(pg.close()))
 
             try:
                 await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
@@ -936,7 +886,7 @@ async def sniff_page(page_url, cookies):
                         continue
                 return False
 
-            await click_first(page, CONSENT_SELECTORS)      # age/consent gate
+            await click_first(page, CONSENT_SELECTORS)
             await page.wait_for_timeout(500)
 
             try:
@@ -1004,7 +954,7 @@ async def sniff_page(page_url, cookies):
                     pokes += 1
                 await page.wait_for_timeout(500)
 
-            if not cands:                                    # DOM / inline JS player configs
+            if not cands:
                 await collect_links()
                 for fr in page.frames:
                     try:
@@ -1023,7 +973,7 @@ async def sniff_page(page_url, cookies):
                 except Exception:
                     pass
 
-            if not cands:                                    # last: download button click
+            if not cands:
                 for sel in ['a:has-text("Download")', 'button:has-text("Download")', 'a[download]', '.download-button']:
                     try:
                         el = await page.query_selector(sel)
@@ -1041,6 +991,7 @@ async def sniff_page(page_url, cookies):
                     except Exception:
                         continue
 
+            res["frames"] = [fr.url for fr in page.frames[1:] if (fr.url or "").startswith("http")]
             try:
                 res["cookies"] = await ctx.cookies()
             except Exception:
@@ -1080,17 +1031,14 @@ def gemini_find_url(url, html_text=None):
 
 
 async def resolve_source(url, status):
-    """Link -> Source. Order: direct link -> yt-dlp -> browser sniff -> HTML scan -> Gemini."""
     loop = asyncio.get_running_loop()
     cookies = load_cookie_list()
     run = lambda fn, *a: loop.run_in_executor(None, fn, *a)
 
-    # 0) direct media link
     if classify_media(url):
         await status("🔗 Direct link mila, check kar raha hoon…")
         return await source_from_media(url, origin_of(url) + "/", cookies, url_name=True)
 
-    # 1) yt-dlp (1000+ sites, fast)
     generic = None
     await status("🔎 Analyzing… (yt-dlp)")
     try:
@@ -1104,15 +1052,35 @@ async def resolve_source(url, status):
     except Exception as e:
         logging.info(f"[yt-dlp] {str(e)[:150]}")
 
-    # 2) browser sniff
     await status("🌐 Browser se video dhoondh raha hoon…")
     sn = await sniff_page(url, cookies)
     cookies2 = sn["cookies"] or cookies
     thumbs = [urljoin(url, t) for t in sn["thumbs"] if t]
     cands = sorted(sn["cands"], key=lambda c: -c["score"])[:5]
 
+    async def try_yt(u, ck):
+        h = make_headers(url)
+        if ck:
+            h["Cookie"] = ck
+        try:
+            info = await run(ytdlp_extract, u, h)
+        except Exception:
+            return None
+        if not (info and info.get("formats")):
+            return None
+        sc = source_from_ytinfo(u, info, h, cookies2)
+        sc.thumbs += thumbs
+        return sc
+
+    tasks = [try_yt(f, None) for f in sn["frames"][:4]]
+    ck = cookie_header(url, cookies2)
+    if ck:
+        tasks.append(try_yt(url, ck))
+    pool = [x for x in await asyncio.gather(*tasks) if x]
+    if generic:
+        pool.append(generic)
+
     if not cands:
-        # 3) raw HTML scan
         try:
             sc = make_session(make_headers(url), cookies)
             txt = (await run(lambda: sc.get(url, timeout=25).text))[:600000]
@@ -1134,15 +1102,11 @@ async def resolve_source(url, status):
             c["dur"] = (c["info"] or {}).get("duration") or 0
         await asyncio.gather(*[probe(c) for c in cands])
         best = max(cands, key=lambda c: (c["dur"] >= 30, c["score"], c["dur"]))
-        s = await source_from_media(best["url"], url, cookies2, title=sn["title"], thumbs=thumbs, pre=best.get("info"))
-        if generic and generic.duration >= s.duration:
-            return generic
-        return s
-    if generic:
-        generic.thumbs += thumbs
-        return generic
+        pool.append(await source_from_media(best["url"], url, cookies2, title=sn["title"], thumbs=thumbs,
+                                            pre=best.get("info")))
+    if pool:
+        return max(pool, key=lambda x: (x.duration >= 30, x.duration))
 
-    # 4) Gemini
     if ai_model:
         await status("🤖 Gemini se link nikal raha hoon…")
         u = await run(gemini_find_url, url, sn.get("html"))
@@ -1151,9 +1115,6 @@ async def resolve_source(url, status):
     raise RuntimeError("Video extract nahi ho paaya")
 
 
-# ==========================================
-# 8. DOWNLOAD ENGINES
-# ==========================================
 def _largest_media_file(workdir):
     best, size = None, 0
     for f in os.listdir(workdir):
@@ -1173,19 +1134,28 @@ def ytdlp_download(url, workdir, headers, max_h, prog):
             prog.update("⬇️ Downloading", d.get("downloaded_bytes") or 0,
                         d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
 
-    opts = base_ydl_opts(headers)
-    opts.update({
-        "outtmpl": os.path.join(workdir, "dl.%(ext)s"),
-        "format": "bv*+ba/b",
-        "format_sort": [f"res:{max_h}", "vcodec:h264", "acodec:aac", "ext:mp4:m4a"],
-        "merge_output_format": "mp4",
-        "concurrent_fragment_downloads": 8,
-        "progress_hooks": [hook],
-        "noprogress": True,
-    })
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
-    return _largest_media_file(workdir)
+    sort = [f"res:{max_h}", "vcodec:h264", "proto", "acodec:aac", "ext:mp4:m4a"]
+    last = None
+    for fmt, srt in (("bv*+ba/b", sort), ("b/bv*+ba", None)):
+        opts = base_ydl_opts(headers)
+        opts.update({
+            "outtmpl": os.path.join(workdir, "dl.%(ext)s"), "format": fmt, "merge_output_format": "mp4",
+            "concurrent_fragment_downloads": 8, "progress_hooks": [hook], "noprogress": True,
+        })
+        if srt:
+            opts["format_sort"] = srt
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+            return _largest_media_file(workdir)
+        except Exception as e:
+            last = e
+            for f in os.listdir(workdir):
+                try:
+                    os.remove(os.path.join(workdir, f))
+                except OSError:
+                    pass
+    raise last
 
 
 def ffmpeg_hls_download(url, out, headers, duration, prog):
@@ -1196,7 +1166,6 @@ def ffmpeg_hls_download(url, out, headers, duration, prog):
 
 
 def download_direct(url, out_path, headers, cookies, prog, workers=8):
-    """Multi-connection direct download (Range support ho to 8x tez), warna single stream."""
     s = make_session(headers, cookies)
     label = "⬇️ Downloading"
 
@@ -1207,7 +1176,7 @@ def download_direct(url, out_path, headers, cookies, prog, workers=8):
                 raise IOError(f"HTTP {r.status_code}")
             return r
         except Exception:
-            return s.get(url, stream=True, timeout=(15, 60), allow_redirects=True)   # bina Range ke retry
+            return s.get(url, stream=True, timeout=(15, 60), allow_redirects=True)
 
     r = first_request()
     r.raise_for_status()
@@ -1282,7 +1251,6 @@ def _parallel_download(session, url, out_path, total, workers, cb):
 
 
 def choose_tier(src: Source) -> int:
-    """Estimate 2GB se upar ho to chup-chap 720p."""
     if src.mode == "ytdlp" and src.est:
         size, _ = src.est.get(MAX_HEIGHT, (0, 0))
         if size and size > UPLOAD_LIMIT:
@@ -1317,7 +1285,6 @@ def download_media(src: Source, workdir, prog):
 
 
 def fetch_thumbnail(job: Job):
-    """HQ thumbnail: page/yt-dlp thumbnail -> saved frame -> source se frame."""
     if job.thumb_path and os.path.exists(job.thumb_path):
         return job.thumb_path
     s = job.src
@@ -1332,7 +1299,7 @@ def fetch_thumbnail(job: Job):
             raw = os.path.join(THUMB_DIR, f"{job.id}_src{ext}")
             with open(raw, "wb") as f:
                 f.write(r.content)
-            if ext == ".img":                       # webp/avif -> jpg
+            if ext == ".img":
                 out = os.path.join(THUMB_DIR, f"{job.id}_src.jpg")
                 subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", raw, "-q:v", "2", out],
                                capture_output=True, timeout=60)
@@ -1358,14 +1325,7 @@ def fetch_thumbnail(job: Job):
     return None
 
 
-# ==========================================
-# 9. UI (cards, cut panel)
-# ==========================================
-MODE_LABEL = {
-    "auto": "🤖 Auto (chhota=Accurate, lamba=Fast)",
-    "fast": "⚡ Fast (keyframe, instant)",
-    "accurate": "🎯 Accurate (frame-exact)",
-}
+MODE_LABEL = {"exact": "🎯 Exact (frame-exact)", "fast": "⚡ Fast (keyframe)"}
 
 
 def quality_label(src: Source) -> str:
@@ -1395,41 +1355,42 @@ def card_kb(job: Job) -> InlineKeyboardMarkup:
     ])
 
 
+def push(job: Job, d):
+    attr = "cs" if job.sel == "s" else "ce"
+    cur = "000000" if job.fresh else fmt_hms(getattr(job, attr)).replace(":", "")[-6:].rjust(6, "0")
+    n = ("0" + cur[:-1]) if d is None else (cur + d)[-6:]
+    setattr(job, attr, float(int(n[:2]) * 3600 + int(n[2:4]) * 60 + int(n[4:])))
+    job.fresh = False
+
+
 def panel_text(job: Job) -> str:
     s = job.src
-    mark = lambda f, icon: "👉" if job.sel == f else icon
+    warn = ""
+    if job.ce <= job.cs:
+        warn = "\n⚠️ End, Start se bada hona chahiye"
+    elif s.duration and job.cs >= s.duration:
+        warn = "\n⚠️ Start video se bahar hai"
     return (
         f"✂️ <b>Cut Video</b>\n🎬 <code>{esc(s.title[:80])}</code>\n"
-        f"⏱ Total: <code>{fmt_hms(s.duration) if s.duration else 'unknown'}</code>\n\n"
-        f"{mark('s', '▶️')} Start: <code>{fmt_hms(job.cs)}</code>\n"
-        f"{mark('e', '⏹')} End:   <code>{fmt_hms(job.ce)}</code>\n"
-        f"📏 Clip: <code>{fmt_hms(job.ce - job.cs)}</code>\n"
-        f"⚙️ Mode: {MODE_LABEL[job.mode]}\n\n"
-        f"💡 Ya seedha type karo: <code>1:30-5:45</code>"
+        f"⏱ Total: <code>{fmt_hms(s.duration) if s.duration else 'unknown'}</code>\n"
+        f"📏 Clip: <code>{fmt_hms(max(0, job.ce - job.cs))}</code>{warn}\n\n"
+        f"👇 Start/End chuno, phir keypad se time daalo (HH:MM:SS)"
     )
 
 
 def panel_kb(job: Job) -> InlineKeyboardMarkup:
     i = job.id
     b = lambda t, d: InlineKeyboardButton(t, callback_data=d)
+    mk = lambda f, n, v: b(("✅ " if job.sel == f else "") + f"{n} {fmt_hms(v)}", f"cs:{i}:{f}")
+    kp = lambda *ds: [b(d, f"cd:{i}:{d}") for d in ds]
     return InlineKeyboardMarkup([
-        [b(("✅ " if job.sel == "s" else "") + "▶️ Start", f"cs:{i}:s"),
-         b(("✅ " if job.sel == "e" else "") + "⏹ End", f"cs:{i}:e")],
-        [b("−10m", f"ca:{i}:-600"), b("−1m", f"ca:{i}:-60"), b("−10s", f"ca:{i}:-10"), b("−1s", f"ca:{i}:-1")],
-        [b("+1s", f"ca:{i}:1"), b("+10s", f"ca:{i}:10"), b("+1m", f"ca:{i}:60"), b("+10m", f"ca:{i}:600")],
-        [b("🔄 Reset", f"cr:{i}"), b("⚙️ Mode", f"cm:{i}")],
+        [mk("s", "▶️", job.cs), mk("e", "⏹", job.ce)],
+        kp("1", "2", "3"), kp("4", "5", "6"), kp("7", "8", "9"),
+        [b("00", f"cd:{i}:00"), b("0", f"cd:{i}:0"), b("⌫", f"cb:{i}")],
+        [b("🗑 Clear", f"cc:{i}"), b("⏩ End=Full", f"cf:{i}"), b(MODE_LABEL[job.mode].split(" (")[0], f"cm:{i}")],
         [b("✅ Cut + Download", f"cg:{i}")],
         [b("⬅️ Back", f"cx:{i}")],
     ])
-
-
-def adjust(job: Job, delta: float):
-    D = job.src.duration
-    hi = D if D else 10 ** 7
-    if job.sel == "s":
-        job.cs = max(0.0, min(job.cs + delta, job.ce - 1))
-    else:
-        job.ce = max(job.cs + 1, min(job.ce + delta, hi))
 
 
 def thumb_kb(job: Job, seconds) -> InlineKeyboardMarkup:
@@ -1437,17 +1398,13 @@ def thumb_kb(job: Job, seconds) -> InlineKeyboardMarkup:
         f"🖼 Thumbnail  •  ⏱ {fmt_dur(seconds)}", callback_data=f"th:{job.id}")]])
 
 
-# ==========================================
-# 10. PIPELINE
-# ==========================================
 def stage_a(job: Job, cut, workdir, prog: Progress):
-    """Download -> compat -> HQ frame -> (cut + fit). Thread mein chalta hai."""
     src = job.src
     path = download_media(src, workdir, prog)
     path = ensure_compatible(path, lambda c, t: prog.update("🔧 Converting", c, t, "time"))
     info = ffprobe(path) or {}
     D = info.get("duration") or src.duration or 0
-    try:                                           # thumbnail button ke liye HQ frame save
+    try:
         grab_frame(path, os.path.join(THUMB_DIR, f"{job.id}_hq.jpg"), at=max(1, D * 0.1))
     except Exception:
         pass
@@ -1458,8 +1415,7 @@ def stage_a(job: Job, cut, workdir, prog: Progress):
         if end - start < 0.5:
             raise RuntimeError("Cut range invalid (video se bahar)")
         raw = os.path.join(workdir, "cut_raw.mp4")
-        used = cut_video(path, raw, start, end, mode,
-                         lambda c, t: prog.update("✂️ Cutting", c, t, "time"))
+        used = cut_video(path, raw, start, end, mode, info, prog)
         fitted, method = fit_to_limit(raw, os.path.join(workdir, "cut_fit.mp4"), prog)
         out["cut"] = {"path": fitted, "start": start, "end": end, "mode": used, "method": method,
                       "info": ffprobe(fitted) or {}}
@@ -1500,7 +1456,6 @@ async def run_delivery(client, job: Job, cut):
     global active_downloads
     loop = asyncio.get_running_loop()
     job.busy = True
-    ACTIVE_CUT.pop(job.chat_id, None)
     msg = job.msg
     header = f"🎬 <b>{esc(job.src.title[:70])}</b>"
     prog = Progress(loop, msg, header)
@@ -1518,12 +1473,12 @@ async def run_delivery(client, job: Job, cut):
                     (name_from_url(job.src.dl_url) if job.src.use_url_name else job.src.title) or "video")
                 dur = res["dur"]
 
-                if res["cut"]:                                    # 1) cut video pehle (jaldi milti hai)
+                if res["cut"]:
                     c = res["cut"]
                     csize = os.path.getsize(c["path"])
                     cdur = c["info"].get("duration") or (c["end"] - c["start"])
                     extra = (f"\n✂️ <b>Cut:</b> <code>{fmt_hms(c['start'])} → {fmt_hms(c['end'])}</code>"
-                             f" ({'frame-exact' if c['mode'] == 'accurate' else 'keyframe'})")
+                             f" ({'frame-exact' if c['mode'] == 'exact' else 'keyframe'})")
                     if c["method"] != "none":
                         extra += "\n🗜 2GB limit ke liye compress hui"
                     fname = f"{base}_cut_{fmt_hms(c['start']).replace(':', '-')}_{fmt_hms(c['end']).replace(':', '-')}.mp4"
@@ -1531,7 +1486,6 @@ async def run_delivery(client, job: Job, cut):
                                    make_caption(base, c["info"], csize, extra), c["info"],
                                    thumb_kb(job, cdur), prog, "cut", workdir)
 
-                # 2) full video (zaroorat par hi compress)
                 full = res["full"]
                 method = "none"
                 if os.path.getsize(full) > UPLOAD_LIMIT:
@@ -1581,7 +1535,6 @@ async def analyze_url(client, status_msg: Message, chat_id: int, url: str):
             job = Job(id=secrets.token_hex(4), chat_id=chat_id, src=src, msg=status_msg)
             job.ce = src.duration or 600.0
             JOBS[job.id] = job
-            # buttons ab aate hain — analysis (length etc.) complete hone ke BAAD
             await status_msg.edit_text(card_text(job), reply_markup=card_kb(job))
         except Exception as e:
             logging.error(f"[analyze] {url}: {e}")
@@ -1594,16 +1547,13 @@ async def analyze_url(client, status_msg: Message, chat_id: int, url: str):
             analyzing -= 1
 
 
-# ==========================================
-# 11. TELEGRAM HANDLERS
-# ==========================================
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(_, message: Message):
     await message.reply_text(
         "👋 <b>Universal Video Downloader</b>\n\n"
         "🔗 Link bhejo (ek message mein kai links bhi chalenge)\n"
         "🧠 Analyze ke baad buttons aate hain: <b>Download</b> / <b>Cut + Download</b>\n"
-        "✂️ Cut mein Start/End buttons se set karo — chat mein <b>cut + full</b> dono videos aati hain\n"
+        "✂️ Cut mein keypad se Start/End time daalo — chat mein <b>cut + full</b> dono videos aati hain\n"
         "📺 Best quality (1080p/720p). 2GB se badi ho tabhi compress\n"
         "🖼 Har video ke saath <b>Thumbnail</b> button (HQ thumbnail chahiye to dabao)\n\n"
         "⚡ Engines: yt-dlp → Browser → HTML scan → Gemini AI"
@@ -1617,9 +1567,9 @@ async def help_cmd(_, message: Message):
         "1️⃣ Video page ka URL bhejo\n"
         "2️⃣ Bot analyze karke length ke saath buttons dega\n"
         "3️⃣ <b>⬇️ Download</b> = sirf full video\n"
-        "4️⃣ <b>✂️ Cut</b> = Start/End set karo (ya type: <code>1:30-5:45</code>), phir ✅\n"
+        "4️⃣ <b>✂️ Cut</b> = keypad se Start/End time daalo, phir ✅\n"
         "5️⃣ Video ke neeche <b>🖼 Thumbnail</b> dabao to HQ thumbnail milega\n\n"
-        "<b>Cut modes:</b> ⚡ Fast (keyframe pe, instant) • 🎯 Accurate (frame-exact) • 🤖 Auto\n"
+        "<b>Cut modes:</b> 🎯 Exact (frame-exact) • ⚡ Fast (keyframe pe, instant)\n"
         "<b>Login wali sites:</b> browser se <code>cookies.txt</code> (Netscape format) bot folder mein rakho"
     )
 
@@ -1642,29 +1592,6 @@ async def url_handler(client, message: Message):
         spawn(analyze_url(client, st, message.chat.id, u))
 
 
-def _range_filter(_, __, m):
-    t = getattr(m, "text", None)
-    return bool(t) and m.chat.id in ACTIVE_CUT and not URL_REGEX.search(t) and RANGE_RE.match(t) is not None
-
-
-@app.on_message(filters.private & filters.create(_range_filter))
-async def range_text_handler(client, message: Message):
-    job = JOBS.get(ACTIVE_CUT.get(message.chat.id))
-    if not job or job.busy:
-        return
-    m = RANGE_RE.match(message.text)
-    a, b = parse_time(m.group(1)), parse_time(m.group(2))
-    D = job.src.duration
-    if a is None or b is None or b <= a or (D and a >= D):
-        return await message.reply_text("⚠️ Range galat hai. Example: <code>1:30-5:45</code>")
-    job.cs, job.ce = a, (min(b, D) if D else b)
-    try:
-        await job.msg.edit_text(panel_text(job), reply_markup=panel_kb(job))
-    except Exception:
-        pass
-    await message.reply_text(f"✅ Range set: <code>{fmt_hms(job.cs)} → {fmt_hms(job.ce)}</code>")
-
-
 @app.on_callback_query()
 async def on_callback(client, cq: CallbackQuery):
     parts = (cq.data or "").split(":")
@@ -1673,7 +1600,7 @@ async def on_callback(client, cq: CallbackQuery):
     if not job:
         return await cq.answer("⌛ Ye request purani ho gayi — link dobara bhejo.", show_alert=True)
 
-    if act == "th":                                           # thumbnail
+    if act == "th":
         await cq.answer("🖼 Thumbnail la raha hoon…")
         loop = asyncio.get_running_loop()
         path = await loop.run_in_executor(None, fetch_thumbnail, job)
@@ -1702,43 +1629,35 @@ async def on_callback(client, cq: CallbackQuery):
 
     if act == "dl":
         await cq.answer("⬇️ Shuru ho gaya…")
-        spawn(run_delivery(client, job, None))
-    elif act == "cut":
-        job.cs, job.ce, job.sel = 0.0, (job.src.duration or 600.0), "s"
-        ACTIVE_CUT[job.chat_id] = job.id
+        return spawn(run_delivery(client, job, None))
+    if act == "cx":
         await cq.answer()
-        await refresh()
-    elif act == "cs":
-        job.sel = parts[2]
-        await cq.answer("▶️ Start edit" if job.sel == "s" else "⏹ End edit")
-        await refresh()
-    elif act == "ca":
-        adjust(job, float(parts[2]))
-        await cq.answer()
-        await refresh()
-    elif act == "cm":
-        order = ["auto", "fast", "accurate"]
-        job.mode = order[(order.index(job.mode) + 1) % 3]
-        await cq.answer(MODE_LABEL[job.mode])
-        await refresh()
-    elif act == "cr":
-        job.cs, job.ce = 0.0, (job.src.duration or 600.0)
-        await cq.answer("Reset")
-        await refresh()
-    elif act == "cx":
-        ACTIVE_CUT.pop(job.chat_id, None)
-        await cq.answer()
-        await cq.message.edit_text(card_text(job), reply_markup=card_kb(job))
-    elif act == "cg":
-        if job.ce - job.cs < 1:
-            return await cq.answer("⚠️ Clip kam se kam 1 second ki honi chahiye", show_alert=True)
+        return await cq.message.edit_text(card_text(job), reply_markup=card_kb(job))
+    if act == "cg":
+        D = job.src.duration
+        if job.ce - job.cs < 1 or (D and job.cs >= D):
+            return await cq.answer("⚠️ Start/End sahi daalo", show_alert=True)
         await cq.answer("✂️ Shuru ho gaya…")
-        spawn(run_delivery(client, job, (job.cs, job.ce, job.mode)))
+        return spawn(run_delivery(client, job, (job.cs, min(job.ce, D) if D else job.ce, job.mode)))
+    if act == "cut":
+        job.cs, job.ce, job.sel, job.fresh = 0.0, job.src.duration or 600.0, "s", True
+    elif act == "cs":
+        job.sel, job.fresh = parts[2], True
+    elif act == "cd":
+        push(job, parts[2])
+    elif act == "cb":
+        push(job, None)
+    elif act == "cc":
+        setattr(job, "cs" if job.sel == "s" else "ce", 0.0)
+        job.fresh = True
+    elif act == "cf":
+        job.ce = job.src.duration or job.ce
+    elif act == "cm":
+        job.mode = "fast" if job.mode == "exact" else "exact"
+    await cq.answer()
+    await refresh()
 
 
-# ==========================================
-# 12. HOUSEKEEPING + MAIN
-# ==========================================
 async def janitor():
     while True:
         await asyncio.sleep(600)
@@ -1762,7 +1681,7 @@ async def main():
     global ANALYZE_SEM, DL_SEM
     ANALYZE_SEM = asyncio.Semaphore(MAX_CONCURRENT)
     DL_SEM = asyncio.Semaphore(MAX_CONCURRENT)
-    for d in os.listdir(DOWNLOAD_DIR):                       # purane leftover saaf
+    for d in os.listdir(DOWNLOAD_DIR):
         shutil.rmtree(os.path.join(DOWNLOAD_DIR, d), ignore_errors=True)
     if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
         logging.error("❌ ffmpeg/ffprobe install nahi hai! (apt install ffmpeg)")
