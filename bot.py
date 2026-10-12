@@ -108,6 +108,48 @@ URL_REGEX = re.compile(r'https?://[^\s<>"\']+')
 TIME_PAT = r"\d{1,2}(?::\d{1,2}){1,2}"
 RANGE_RE = re.compile(rf"(?<![\d:])({TIME_PAT})\s*(?:-|–|—|to|se)\s*({TIME_PAT})(?![\d:])", re.I)
 
+# ---------- anti-spam state ----------
+URL_DEDUP = {}        # chat_id -> {url: ts}   duplicate URL block
+MSG_RATE = {}         # chat_id -> [ts,...]   per-chat rate limit
+MISC_COOLDOWN = {}    # (chat_id, key) -> ts  cooldown for start/help/status/chat
+LAST_REPLY = {}       # chat_id -> text       avoid identical chat replies
+BOT_MSG_TS = {}       # chat_id -> ts         last bot outgoing msg time
+
+
+def _dedup_url(chat_id, url, window=90):
+    """Return True if this URL is fresh (not seen recently for this chat)."""
+    now = time.time()
+    d = URL_DEDUP.get(chat_id) or {}
+    # purge old
+    d = {u: t for u, t in d.items() if now - t < window}
+    URL_DEDUP[chat_id] = d
+    if url in d:
+        return False
+    d[url] = now
+    return True
+
+
+def _rate_ok(chat_id, max_msgs=12, window=15):
+    """Return True if chat is under its message rate limit."""
+    now = time.time()
+    times = [t for t in MSG_RATE.get(chat_id, []) if now - t < window]
+    if len(times) >= max_msgs:
+        MSG_RATE[chat_id] = times
+        return False
+    times.append(now)
+    MSG_RATE[chat_id] = times
+    return True
+
+
+def _cooldown_ok(chat_id, key, seconds=20):
+    """Return True if the cooldown for (chat_id, key) has expired."""
+    now = time.time()
+    k = (chat_id, key)
+    if now - MISC_COOLDOWN.get(k, 0) < seconds:
+        return False
+    MISC_COOLDOWN[k] = now
+    return True
+
 
 def spawn(coro):
     t = asyncio.create_task(coro)
@@ -2350,30 +2392,54 @@ async def template_reply(message, arg):
 
 
 async def misc_reply(message: Message, it: Intent) -> bool:
+    chat = message.chat.id
     if it.action == "status":
+        if not _cooldown_ok(chat, "status", 10):
+            return True
         await message.reply_text(status_text(), quote=True)
     elif it.action == "help":
+        if not _cooldown_ok(chat, "help", 30):
+            return True
         await message.reply_text(HELP_TEXT, quote=True)
     elif it.action == "start":
+        if not _cooldown_ok(chat, "start", 30):
+            return True
         await message.reply_text(START_TEXT, quote=True)
     elif it.action == "template":
+        if not _cooldown_ok(chat, "template", 3):
+            return True
         await template_reply(message, it.arg)
     elif it.action in ("ask", "chat"):
-        await message.reply_text(f"🤖 {esc(it.reply or 'Samajh nahi aaya, thoda aur batao.')}", quote=True)
+        txt = f"🤖 {esc(it.reply or 'Samajh nahi aaya, thoda aur batao.')}"
+        # same reply within short window => skip
+        if LAST_REPLY.get(chat) == txt and not _cooldown_ok(chat, "chat", 25):
+            return True
+        if not _cooldown_ok(chat, "chat", 6):
+            return True
+        LAST_REPLY[chat] = txt
+        await message.reply_text(txt, quote=True)
     else:
         return False
     return True
 
 
 async def download_message(client, message, text, urls):
-    urls = urls[:10]
+    chat_id = message.chat.id
+    # 1) drop URLs already processed recently in this chat
+    fresh = [u for u in urls if _dedup_url(chat_id, u)]
+    if not fresh:
+        logging.info(f"[dedup] all URLs already seen for chat {chat_id}, skipping")
+        return
+    # 2) cap to a small batch to prevent flood
+    fresh = fresh[:5]
+
     it = await get_intent(URL_REGEX.sub(" ", text).strip(), True, "")
     if it.action in ("status", "help", "start", "template", "ask") and await misc_reply(message, it):
         return
     note = f"🤖 {esc(it.reply)}\n\n" if it.reply else ""
-    for u in urls:
+    for u in fresh:
         st = await message.reply_text(f"{note}🔍 <b>Analyzing…</b>\n<code>{esc(u[:60])}</code>", quote=True)
-        spawn(analyze_url(client, st, message.chat.id, u, message.id, it, note))
+        spawn(analyze_url(client, st, chat_id, u, message.id, it, note))
 
 
 async def chat_message(client, message, text):
@@ -2382,12 +2448,18 @@ async def chat_message(client, message, text):
     if await misc_reply(message, it):
         return
     if not job:
+        if not _cooldown_ok(message.chat.id, "nojob", 15):
+            return
         return await message.reply_text("🔗 Pehle video ka link bhejo.", quote=True)
     if it.action == "none":
+        if not _cooldown_ok(message.chat.id, "unclear", 15):
+            return
         return await message.reply_text(
             "🤖 Samajh nahi aaya. Aise likho: <code>720p mein download</code>, <code>audio do</code>, "
             "<code>1:20 se 2:45 cut karo</code>, <code>help</code>", quote=True)
     if job.busy:
+        if not _cooldown_ok(message.chat.id, "busy", 5):
+            return
         return await message.reply_text("⏳ Pichla kaam abhi chal raha hai.", quote=True)
     note = f"🤖 {esc(it.reply)}\n\n" if it.reply else ""
     st = await message.reply_text(f"{note}⏳ Shuru kar raha hoon…", quote=True)
@@ -2410,9 +2482,14 @@ async def queue_cmd(_, message: Message):
     await message.reply_text(status_text())
 
 
-@app.on_message(filters.private & allowed & ~filters.command(["start", "help", "queue"]))
+@app.on_message(filters.private & filters.incoming & allowed & ~filters.bot & ~filters.service
+                & ~filters.command(["start", "help", "queue"]))
 async def router(client, message: Message):
     try:
+        chat_id = message.chat.id
+        if not _rate_ok(chat_id):
+            logging.warning(f"[rate] dropping message flood from chat {chat_id}")
+            return
         if message.media_group_id:
             return await album_post(client, message)
         text = message.text or message.caption or ""
@@ -2539,6 +2616,15 @@ async def janitor():
             p = os.path.join(DOWNLOAD_DIR, d)
             if os.path.isdir(p) and now - os.path.getmtime(p) > 4 * 3600:
                 shutil.rmtree(p, ignore_errors=True)
+        # purge anti-spam maps
+        for cid in list(URL_DEDUP):
+            URL_DEDUP[cid] = {u: t for u, t in URL_DEDUP[cid].items() if now - t < 300}
+            if not URL_DEDUP[cid]:
+                URL_DEDUP.pop(cid, None)
+        for cid in list(MSG_RATE):
+            MSG_RATE[cid] = [t for t in MSG_RATE[cid] if now - t < 60]
+            if not MSG_RATE[cid]:
+                MSG_RATE.pop(cid, None)
 
 
 async def main():
