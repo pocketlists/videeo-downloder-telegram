@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import random
 import json
 import time
 import html
@@ -27,7 +28,9 @@ import cloudscraper
 from pyrogram import Client, filters, enums, idle
 from pyrogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaPhoto, InputMediaVideo, InputMediaDocument,
 )
+from pyrogram.errors import FloodWait
 from playwright.async_api import async_playwright
 
 try:
@@ -49,6 +52,10 @@ MAX_HEIGHT = 4320
 FALLBACK_HEIGHT = 720
 TIERS = (MAX_HEIGHT, FALLBACK_HEIGHT)
 COOKIES_FILE = "cookies.txt"
+ALLOWED = {int(x) for x in re.findall(r"\d+", os.environ.get("ALLOWED_IDS", ""))}
+PROXY_URL = os.environ.get("PROXY_URL", "")
+FORCE_IPV4 = os.environ.get("FORCE_IPV4", "0") == "1"
+HEADLESS = os.environ.get("HEADLESS", "1") == "1"
 
 DOWNLOAD_DIR = "./downloads/"
 THUMB_DIR = "./thumbs/"
@@ -90,6 +97,12 @@ DL_SEM = None
 active_downloads = 0
 analyzing = 0
 NO_IMP = False
+LAST = {}
+FAILS = {}
+PREFS = {}
+ALBUMS = {}
+QUOTE_OK = True
+MAX_POST_LINKS = 60
 BG_TASKS = set()
 URL_REGEX = re.compile(r'https?://[^\s<>"\']+')
 TIME_PAT = r"\d{1,2}(?::\d{1,2}){1,2}"
@@ -141,6 +154,31 @@ CONSENT_SELECTORS = [
 PLAY_JS = """() => { document.querySelectorAll('video').forEach(v => {
     try { v.muted = true; const p = v.play(); if (p && p.catch) p.catch(()=>{}); } catch(e){} }); }"""
 
+STEALTH_JS = """
+Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
+Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+window.chrome=window.chrome||{runtime:{}};
+const _q=navigator.permissions&&navigator.permissions.query;
+if(_q){navigator.permissions.query=p=>p&&p.name==='notifications'?Promise.resolve({state:Notification.permission}):_q.call(navigator.permissions,p)}
+"""
+AGE_JS = r"""() => {
+  const bad = /\b(exit|leave|no|under|not|decline|cancel|close)\b/i;
+  const good = /(\b(i\s*am|i'm|im|yes)\b[^.]{0,30}\b(18|21)\b)|\b18\s*\+|\b(over|above)\s*(18|21)\b|\b(enter|agree|accept|continue|confirm|proceed)\b/i;
+  const txt = e => (e.innerText || e.value || e.getAttribute('aria-label') || '').trim();
+  const els = [...document.querySelectorAll('button,a,input[type=button],input[type=submit],[role=button],.btn,[class*=enter],[class*=agree],[id*=age],[class*=age]')];
+  const cand = els.filter(e => {
+    const r = e.getBoundingClientRect();
+    if (!r.width || !r.height) return false;
+    const t = txt(e);
+    return t && t.length <= 60 && good.test(t) && !bad.test(t);
+  });
+  cand.sort((a, b) => (/18|21/.test(txt(b)) ? 1 : 0) - (/18|21/.test(txt(a)) ? 1 : 0));
+  if (cand[0]) { const t = txt(cand[0]); cand[0].click(); return t; }
+  return '';
+}"""
+AGE_COOKIES = ("age_verified", "ageverified", "age_check", "agecheck", "over18", "is_adult", "adult",
+               "agreed", "age_gate", "age-verified", "isAdult")
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.ico', '.bmp', '.avif')
 VIDEO_FILE_EXTS = ('.mp4', '.webm', '.mkv', '.mov', '.m4v', '.avi', '.flv')
 SEGMENT_EXTS = ('.ts', '.m4s', '.aac', '.m4a', '.vtt', '.srt', '.key', '.mp3')
@@ -307,6 +345,8 @@ def cookie_header(url: str, cookies: list) -> str:
 def make_session(headers: dict, cookies: list):
     s = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "desktop": True})
     s.headers.update(headers or {})
+    if PROXY_URL:
+        s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
     for c in cookies or []:
         try:
             s.cookies.set(c["name"], c["value"], domain=c.get("domain") or None, path=c.get("path") or "/")
@@ -338,6 +378,7 @@ class Source:
     size: int = 0
     formats: list = field(default_factory=list)
     est: dict = field(default_factory=dict)
+    quals: list = field(default_factory=list)
     thumbs: list = field(default_factory=list)
     use_url_name: bool = False
 
@@ -361,10 +402,23 @@ class Job:
     q: int = 0
 
 
+@dataclass
+class Intent:
+    action: str = "card"
+    q: int = 0
+    start: float = None
+    end: float = None
+    mode: str = ""
+    reply: str = ""
+    arg: str = ""
+
+
 def ffprobe(target, headers=None, timeout=40):
     cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams"]
     if str(target).startswith("http"):
         cmd += ["-rw_timeout", "20000000"]
+        if PROXY_URL:
+            cmd += ["-http_proxy", PROXY_URL]
         if headers:
             cmd += ["-headers", _hdr_str(headers)]
     cmd.append(str(target))
@@ -681,18 +735,28 @@ def extract_audio(path, out, title, cb=None):
 class Progress:
     def __init__(self, loop, msg, header=""):
         self.loop, self.msg, self.header = loop, msg, header
-        self.last = 0.0
-        self.t0 = time.time()
+        self.t_start = self.t0 = time.time()
         self.cur_stage = ""
+        self.last_edit = 0.0
+        self.block = 0.0
+        self.last_text = ""
+
+    def _ready(self, now, force):
+        if now < self.block:
+            return False
+        el = now - self.t_start
+        gap = 3.5 if force else (6.0 if el < 30 else 10.0 if el < 120 else 15.0)
+        return now - self.last_edit >= gap
 
     def update(self, stage, done, total, kind="bytes"):
         now = time.time()
-        if stage != self.cur_stage:
-            self.cur_stage, self.t0, self.last = stage, now, 0.0
+        changed = stage != self.cur_stage
+        if changed:
+            self.cur_stage, self.t0 = stage, now
         finished = bool(total) and done >= total
-        if now - self.last < 3 and not finished:
+        if not self._ready(now, changed or finished):
             return
-        self.last = now
+        self.last_edit = now
         pct = f"{done / total * 100:.1f}%" if total else "…"
         if kind == "time":
             body = f"Progress: <code>{pct}</code>  (<code>{fmt_dur(done)}/{fmt_dur(total)}</code>)"
@@ -707,11 +771,18 @@ class Progress:
 
     async def stage(self, text):
         self.cur_stage = text
+        self.last_edit = time.time()
         await self._edit(f"{self.header}\n⏳ <b>{text}</b>")
 
     async def _edit(self, text):
+        if text == self.last_text:
+            return
+        self.last_text = text
         try:
             await self.msg.edit_text(text)
+        except FloodWait as e:
+            self.block = time.time() + e.value + 1
+            self.last_text = ""
         except Exception:
             pass
 
@@ -725,6 +796,10 @@ def base_ydl_opts(headers=None, fast=False):
     }
     if os.path.exists(COOKIES_FILE):
         o["cookiefile"] = COOKIES_FILE
+    if PROXY_URL:
+        o["proxy"] = PROXY_URL
+    if FORCE_IPV4:
+        o["source_address"] = "0.0.0.0"
     imp = None if NO_IMP else impersonate_target()
     if imp:
         o["impersonate"] = imp
@@ -781,6 +856,17 @@ def est_size(formats, duration, max_h):
     return fsize(best) + (fsize(aud) if aud else 0), h
 
 
+def build_quals(formats, duration):
+    hs = sorted({int(f["height"]) for f in formats
+                 if f.get("vcodec") not in (None, "none") and f.get("height")}, reverse=True)
+    out = []
+    for h in hs:
+        size, ah = est_size(formats, duration, h)
+        if ah == h:
+            out.append((h, size))
+    return out[:6]
+
+
 def collect_thumbs(info):
     urls = []
     th = [t for t in (info.get("thumbnails") or []) if t.get("url")]
@@ -802,6 +888,7 @@ def source_from_ytinfo(url, info, headers, cookies):
                duration=float(info.get("duration") or 0), thumbs=collect_thumbs(info))
     s.formats = compact_formats(info)
     s.est = {h: est_size(s.formats, s.duration, h) for h in TIERS}
+    s.quals = build_quals(s.formats, s.duration)
     s.height = s.est[MAX_HEIGHT][1] or int(info.get("height") or 0)
     return s
 
@@ -826,6 +913,7 @@ async def source_from_media(media_url, page_url, cookies, title=None, thumbs=Non
                 s.formats = compact_formats(yi)
                 s.duration = s.duration or float(yi.get("duration") or 0)
                 s.est = {h: est_size(s.formats, s.duration, h) for h in TIERS}
+                s.quals = build_quals(s.formats, s.duration)
                 s.height = s.est[MAX_HEIGHT][1] or s.height
         except Exception as e:
             logging.info(f"[yt-dlp] m3u8 info fail: {e}")
@@ -833,7 +921,7 @@ async def source_from_media(media_url, page_url, cookies, title=None, thumbs=Non
 
 
 def scan_html_for_media(text, base):
-    text = html.unescape((text or "").replace("\\/", "/"))
+    text = html.unescape((text or "").replace("\\/", "/").replace("\\u0026", "&"))
     found = []
     for m in re.finditer(r'(?:https?:)?//[^\s"\'<>\\]+?\.(?:m3u8|mp4|webm|mpd)(?:\?[^\s"\'<>\\]*)?', text, re.I):
         found.append(m.group(0))
@@ -850,8 +938,8 @@ def scan_html_for_media(text, base):
 
 async def sniff_page(page_url, cookies):
     cfg = get_site_config(page_url)
-    cands, seen = {}, set()
-    res = {"cands": [], "title": None, "thumbs": [], "cookies": [], "html": "", "frames": []}
+    cands, seen, netlog = {}, set(), []
+    res = {"cands": [], "title": None, "thumbs": [], "cookies": [], "html": "", "frames": [], "net": netlog, "final": ""}
 
     def add(url, score, kind, size=0, tag=""):
         if not url or not url.startswith("http") or is_image_url(url) or is_bad_url(url):
@@ -881,7 +969,17 @@ async def sniff_page(page_url, cookies):
                     total = int(hd.get("content-length") or 0)
                 except ValueError:
                     pass
+            rt = resp.request.resource_type
+            if rt in ("xhr", "fetch") and total < 2 * MiB and ("json" in ctype or "text" in ctype or "javascript" in ctype):
+                try:
+                    body = await resp.text()
+                    for u in scan_html_for_media(body, url)[:8]:
+                        add(u, 170, classify_media(u) or "mp4", 0, "API")
+                except Exception:
+                    pass
             kind = classify_media(url, ctype, total)
+            if not kind and (ctype.startswith(("video/", "audio/")) or url_path(url).endswith(SEGMENT_EXTS)) and len(netlog) < 40:
+                netlog.append(url)
             if not kind or is_bad_url(url):
                 return
             if kind == "mp4" and 0 < total < 500 * 1024:
@@ -911,18 +1009,23 @@ async def sniff_page(page_url, cookies):
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=[
+            browser = await p.chromium.launch(headless=HEADLESS, proxy=({"server": PROXY_URL} if PROXY_URL else None), args=[
                 "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled", "--autoplay-policy=no-user-gesture-required",
             ])
             ctx = await browser.new_context(user_agent=UA, viewport={"width": 1366, "height": 768},
                                             locale="en-US", accept_downloads=True, ignore_https_errors=True)
-            await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            await ctx.add_init_script(STEALTH_JS)
             if cookies:
                 try:
                     await ctx.add_cookies(cookies)
                 except Exception:
                     pass
+            try:
+                host = urlparse(page_url).netloc.split(":")[0]
+                await ctx.add_cookies([{"name": n, "value": "1", "domain": host, "path": "/"} for n in AGE_COOKIES])
+            except Exception:
+                pass
 
             async def route(r):
                 if r.request.resource_type in ("image", "font"):
@@ -952,7 +1055,30 @@ async def sniff_page(page_url, cookies):
                         continue
                 return False
 
+            async def age_pass():
+                hit = False
+                for fr in page.frames:
+                    try:
+                        if await fr.evaluate(AGE_JS):
+                            hit = True
+                    except Exception:
+                        pass
+                return hit
+
+            for _ in range(10):
+                try:
+                    tl = (await page.title() or "").lower()
+                except Exception:
+                    break
+                if any(k in tl for k in ("just a moment", "attention required", "checking your browser", "verify you are human")):
+                    await page.wait_for_timeout(1500)
+                else:
+                    break
             await click_first(page, CONSENT_SELECTORS)
+            for _ in range(3):
+                if not await age_pass():
+                    break
+                await page.wait_for_timeout(900)
             await page.wait_for_timeout(500)
 
             try:
@@ -1003,6 +1129,7 @@ async def sniff_page(page_url, cookies):
             await collect_links()
 
             async def poke():
+                await age_pass()
                 for fr in page.frames:
                     try:
                         await fr.evaluate(PLAY_JS)
@@ -1057,6 +1184,7 @@ async def sniff_page(page_url, cookies):
                     except Exception:
                         continue
 
+            res["final"] = page.url
             res["frames"] = [fr.url for fr in page.frames[1:] if (fr.url or "").startswith("http")]
             try:
                 res["cookies"] = await ctx.cookies()
@@ -1075,17 +1203,22 @@ async def sniff_page(page_url, cookies):
     return res
 
 
-def gemini_find_url(url, html_text=None):
+def gemini_find_url(url, html_text=None, net=None, cands=None):
     if not ai_model:
         return None
     try:
         if not html_text:
-            sc = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "desktop": True})
+            sc = make_session(make_headers(url), load_cookie_list())
             html_text = sc.get(url, timeout=25).text[:120000]
+        extra = ""
+        if cands:
+            extra += "Candidate media URLs seen in the browser:\n" + "\n".join(c["url"] for c in cands[:10]) + "\n\n"
+        if net:
+            extra += "Other media-like network requests:\n" + "\n".join(net[:15]) + "\n\n"
         prompt = (
             "You are an expert web scraper. Find the MAIN direct video URL (.mp4, .m3u8, .mpd) of this page. "
-            "Ignore thumbnails, ads, trailers, previews. Return ONLY the URL, or NOT_FOUND.\n\n"
-            f"Page URL: {url}\n\nHTML:\n{html_text}"
+            "Ignore thumbnails, ads, trailers, previews. Return ONLY the full absolute URL, or NOT_FOUND.\n\n"
+            f"Page URL: {url}\n\n{extra}HTML:\n{html_text}"
         )
         txt = ai_model.generate_content(prompt).text.strip()
         m = re.search(r'https?://[^\s"\'<>]+', txt)
@@ -1094,6 +1227,118 @@ def gemini_find_url(url, html_text=None):
     except Exception as e:
         logging.error(f"Gemini error: {e}")
     return None
+
+
+INTENT_ACTIONS = ("card", "download", "cut", "audio", "status", "help", "start", "template", "ask", "chat", "none")
+
+
+def gemini_intent(text, has_url, last_title):
+    prompt = (
+        "You are the control brain of a Telegram video downloader bot. The owner writes in Hinglish, Hindi or English. "
+        "Convert the owner's message into ONE JSON command. Output ONLY the JSON object, no markdown.\n"
+        'Schema: {"action": "card|download|cut|audio|status|help|start|template|ask|chat", "quality": integer video '
+        'height (e.g. 2160, 1080, 720, 480; 4320 for best/highest; 0 if not mentioned), "start": "HH:MM:SS" or null, '
+        '"end": "HH:MM:SS" or null, "mode": "exact|fast|null", "arg": "template number as a string, or random, or null", '
+        '"reply": "one short Hinglish line telling the owner what you understood, or the question if action=ask, '
+        'or your answer if action=chat"}\n'
+        "Rules: download/le aao/bhej/chahiye video -> download. audio/mp3/gaana/sirf awaz -> audio. "
+        "cut/trim/kaato with times -> cut (fill start and end). Link given but no clear instruction -> card. "
+        "status/queue -> status. help/kaise use karu -> help. hi/hello/start -> start. "
+        "post template change or choose (template 5, random template) -> template with arg. "
+        "Unclear -> ask with a short question. Casual talk or a question -> chat with a helpful answer. "
+        "If there is no link, the owner refers to the previous video.\n"
+        f"has_link={str(bool(has_url)).lower()}\nprevious_video_title={last_title or 'none'}\n"
+        f"Owner message: {text}"
+    )
+    out = ai_model.generate_content(prompt).text
+    m = re.search(r"\{.*\}", out, re.S)
+    return m.group(0) if m else "{}"
+
+
+def _tsec(v):
+    try:
+        if v is None or v == "" or v == "null":
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        v = str(v).strip()
+        return to_sec(v) if ":" in v else float(v)
+    except Exception:
+        return None
+
+
+def intent_from_ai(d):
+    it = Intent()
+    act = str(d.get("action") or "").lower()
+    it.action = act if act in INTENT_ACTIONS else "card"
+    m = re.search(r"\d+", str(d.get("quality") or ""))
+    it.q = int(m.group(0)) if m else 0
+    if 0 < it.q < 144:
+        it.q = 2160 if it.q == 4 else 1440 if it.q == 2 else 0
+    it.start, it.end = _tsec(d.get("start")), _tsec(d.get("end"))
+    mode = str(d.get("mode") or "").lower()
+    it.mode = mode if mode in ("exact", "fast") else ""
+    it.reply = str(d.get("reply") or "").strip()[:300]
+    it.arg = re.sub(r"[^\w]", "", str(d.get("arg") or ""))[:12].lower()
+    if it.arg == "random":
+        it.arg = "0"
+    return it
+
+
+def rule_intent(text, has_url):
+    it = Intent(action="card" if has_url else "none")
+    t = (text or "").lower()
+    rng = parse_range(text)
+    qm = re.search(r"(\d{3,4})\s*p\b", t)
+    if qm:
+        it.q = int(qm.group(1))
+    elif re.search(r"\b4k\b", t):
+        it.q = 2160
+    elif re.search(r"\b(best|highest|max|full\s*hd|fhd)\b", t):
+        it.q = MAX_HEIGHT
+    elif re.search(r"\b(lowest|low|chhota|small)\b", t):
+        it.q = 360
+    if re.search(r"\btemplates?\b", t):
+        it.action = "template"
+        dm = re.search(r"\b(\d{1,3})\b", t)
+        it.arg = dm.group(1) if dm else ("0" if re.search(r"\b(random|rendom|badlo|badal)\b", t) else "")
+        it.q = 0
+        return it
+    if rng:
+        it.action, it.start, it.end = "cut", rng[0], rng[1]
+    elif re.search(r"\b(audio|mp3|m4a|music|gaana|gana|sound)\b", t):
+        it.action = "audio"
+    elif re.search(r"\b(status|queue)\b", t):
+        it.action = "status"
+    elif re.search(r"\b(help|madad|kaise|commands?)\b", t):
+        it.action = "help"
+    elif re.match(r"\s*(start|shuru|hi|hello|hey|namaste|namaskar)\b", t):
+        it.action = "start"
+    elif it.q or re.search(r"\b(download|dl|bhej|bhejo)\b", t):
+        it.action = "download"
+    return it
+
+
+async def get_intent(text, has_url, last_title):
+    base = rule_intent(text, has_url)
+    t = (text or "").strip()
+    sure = base.action not in ("none", "card") or (base.action == "card" and not t)
+    if sure or not ai_model or len(t) < 3:
+        return base
+    loop = asyncio.get_running_loop()
+    try:
+        raw = await asyncio.wait_for(loop.run_in_executor(None, gemini_intent, text, has_url, last_title), timeout=25)
+        data = json.loads(raw)
+        return intent_from_ai(data) if data else base
+    except Exception as e:
+        logging.info(f"[intent] gemini fail: {str(e)[:120]}")
+        return base
+
+
+class ResolveError(Exception):
+    def __init__(self, msg, diag=None):
+        super().__init__(msg)
+        self.diag = diag or {}
 
 
 async def resolve_source(url, status):
@@ -1106,6 +1351,7 @@ async def resolve_source(url, status):
         return await source_from_media(url, origin_of(url) + "/", cookies, url_name=True)
 
     generic = None
+    err = ""
     await status("🔎 Analyzing… (yt-dlp)")
     try:
         hdr = make_headers(url)
@@ -1116,13 +1362,14 @@ async def resolve_source(url, status):
                 return s
             generic = s
     except Exception as e:
-        logging.info(f"[yt-dlp] {str(e)[:150]}")
+        err = str(e)[:300]
+        logging.info(f"[yt-dlp] {err[:150]}")
 
     await status("🌐 Browser se video dhoondh raha hoon…")
     sn = await sniff_page(url, cookies)
     cookies2 = sn["cookies"] or cookies
     thumbs = [urljoin(url, t) for t in sn["thumbs"] if t]
-    cands = sorted(sn["cands"], key=lambda c: -c["score"])[:5]
+    cands = sorted(sn["cands"], key=lambda c: -c["score"])[:8]
 
     async def try_yt(u, ck):
         h = make_headers(url)
@@ -1142,6 +1389,8 @@ async def resolve_source(url, status):
     ck = cookie_header(url, cookies2)
     if ck:
         tasks.append(try_yt(url, ck))
+    if sn.get("final") and sn["final"] != url:
+        tasks.append(try_yt(sn["final"], ck))
     pool = [x for x in await asyncio.gather(*tasks) if x]
     if generic:
         pool.append(generic)
@@ -1167,18 +1416,23 @@ async def resolve_source(url, status):
             c["info"] = await run(ffprobe, c["url"], h, 25)
             c["dur"] = (c["info"] or {}).get("duration") or 0
         await asyncio.gather(*[probe(c) for c in cands])
-        best = max(cands, key=lambda c: (c["dur"] >= 30, c["score"], c["dur"]))
-        pool.append(await source_from_media(best["url"], url, cookies2, title=sn["title"], thumbs=thumbs,
-                                            pre=best.get("info")))
+        valid = [c for c in cands if c["info"]]
+        best = (max(valid, key=lambda c: (c["dur"] >= 30, c["score"], c["dur"])) if valid
+                else (cands[0] if cands[0]["score"] >= 250 else None))
+        if best:
+            pool.append(await source_from_media(best["url"], url, cookies2, title=sn["title"], thumbs=thumbs,
+                                                pre=best.get("info")))
     if pool:
         return max(pool, key=lambda x: (x.duration >= 30, x.duration))
 
+    diag = {"url": url, "cands": cands, "net": sn.get("net") or [], "html": sn.get("html") or "",
+            "cookies": cookies2, "title": sn["title"], "thumbs": thumbs}
     if ai_model:
         await status("🤖 Gemini se link nikal raha hoon…")
-        u = await run(gemini_find_url, url, sn.get("html"))
+        u = await run(gemini_find_url, url, sn.get("html"), sn.get("net"), cands)
         if u:
             return await source_from_media(u, url, cookies2, title=sn["title"], thumbs=thumbs)
-    raise RuntimeError("Video extract nahi ho paaya")
+    raise ResolveError(err or "Video extract nahi ho paaya", diag)
 
 
 def _largest_media_file(workdir):
@@ -1223,10 +1477,17 @@ def ytdlp_download(url, workdir, headers, max_h, prog, audio=False):
     raise last
 
 
-def ffmpeg_hls_download(url, out, headers, duration, prog):
-    run_ffmpeg(["-allowed_extensions", "ALL", "-headers", _hdr_str(headers), "-i", url, "-c", "copy",
-                "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", out],
-               duration, lambda c, t: prog.update("⬇️ Downloading (ffmpeg)", c, t, "time"))
+def ffmpeg_stream_download(url, out, headers, duration, prog, hls=False):
+    args = []
+    if hls:
+        args += ["-allowed_extensions", "ALL"]
+    if PROXY_URL:
+        args += ["-http_proxy", PROXY_URL]
+    args += ["-headers", _hdr_str(headers), "-i", url, "-c", "copy"]
+    if hls:
+        args += ["-bsf:a", "aac_adtstoasc"]
+    run_ffmpeg(args + ["-movflags", "+faststart", out], duration,
+               lambda c, t: prog.update("⬇️ Downloading (ffmpeg)", c, t, "time"))
     return out
 
 
@@ -1333,12 +1594,6 @@ def download_media(src: Source, workdir, prog, q=0, audio=False):
             return ytdlp_download(src.dl_url, workdir, src.headers, tier, prog, audio)
         except Exception as e:
             errs.append(f"yt-dlp: {str(e)[:150]}")
-        if classify_media(src.dl_url) == "hls":
-            try:
-                return ffmpeg_hls_download(src.dl_url, os.path.join(workdir, "hls.mp4"),
-                                           src.headers, src.duration, prog)
-            except Exception as e:
-                errs.append(f"ffmpeg: {str(e)[:150]}")
     else:
         try:
             return download_direct(src.dl_url, os.path.join(workdir, "dl.mp4"), src.headers, src.cookies, prog)
@@ -1348,6 +1603,13 @@ def download_media(src: Source, workdir, prog, q=0, audio=False):
             return ytdlp_download(src.dl_url, workdir, src.headers, tier, prog, audio)
         except Exception as e:
             errs.append(f"yt-dlp: {str(e)[:150]}")
+    kind = classify_media(src.dl_url)
+    if kind:
+        try:
+            return ffmpeg_stream_download(src.dl_url, os.path.join(workdir, "stream.mp4"),
+                                          src.headers, src.duration, prog, kind == "hls")
+        except Exception as e:
+            errs.append(f"ffmpeg: {str(e)[:150]}")
     raise RuntimeError(" | ".join(errs) or "download fail")
 
 
@@ -1406,38 +1668,30 @@ def fetch_thumbnail(job: Job):
 MODE_LABEL = {"exact": "🎯 Exact (frame-exact)", "fast": "⚡ Fast (keyframe)"}
 
 
+QUALITY_TAG = {2160: " 4K", 1440: " 2K", 1080: " FHD", 720: " HD"}
+
+
 def quality_options(s: Source) -> list:
-    if s.mode == "ytdlp" and s.est:
-        sb, hb = s.est.get(MAX_HEIGHT, (0, 0))
-        s7, h7 = s.est.get(FALLBACK_HEIGHT, (0, 0))
-        if hb:
-            opts = [(MAX_HEIGHT, hb, sb)]
-            if h7 and h7 < hb:
-                opts.append((FALLBACK_HEIGHT, h7, s7))
-            return opts
-    return [(MAX_HEIGHT, s.height, s.size)]
-
-
-def dl_label(h, size, only) -> str:
-    t = f"{h}p" if h else ("" if only else "Best")
-    z = f"~{short_bytes(size)}" if size else ""
-    return "⬇️ " + " • ".join(x for x in (("Download" if only else ""), t, z) if x)
+    return list(s.quals) if s.quals else [(s.height, s.size)]
 
 
 def card_text(job: Job) -> str:
     s = job.src
     lines = [f"🎬 <b>{esc(s.title[:120])}</b>", ""]
     lines.append(f"⏱ Length: <code>{fmt_dur(s.duration) if s.duration else 'unknown'}</code>")
-    lines.append("\n👇 <b>Kya karna hai?</b>")
+    lines.append("")
+    for h, z in quality_options(s):
+        lines.append(f"📺 <code>{f'{h}p' if h else 'Best'}</code>" + (f"  •  <code>~{humanbytes(z)}</code>" if z else ""))
+    lines.append("\n👇 <b>Quality chuno ya kuch aur karo</b>")
     return "\n".join(lines)
 
 
 def card_kb(job: Job) -> InlineKeyboardMarkup:
     s = job.src
     d = fmt_dur(s.duration) if s.duration else "?"
-    opts = quality_options(s)
-    rows = [[InlineKeyboardButton(dl_label(h, z, len(opts) == 1), callback_data=f"dl:{job.id}:{q}")]
-            for q, h, z in opts]
+    btns = [InlineKeyboardButton(f"⬇️ {h}p{QUALITY_TAG.get(h, '')}" if h else "⬇️ Download",
+                                 callback_data=f"dl:{job.id}:{h}") for h, _ in quality_options(s)]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     rows.append([InlineKeyboardButton(f"✂️ Cut + Download  •  ⏱ {d}", callback_data=f"cut:{job.id}")])
     rows.append([InlineKeyboardButton("🎵 Audio", callback_data=f"au:{job.id}")])
     return InlineKeyboardMarkup(rows)
@@ -1476,8 +1730,8 @@ def panel_kb(job: Job) -> InlineKeyboardMarkup:
         kp("1", "2", "3"), kp("4", "5", "6"), kp("7", "8", "9"),
         [b("00", f"cd:{i}:00"), b("0", f"cd:{i}:0"), b("⌫", f"cb:{i}")],
         [b("🗑 Clear", f"cc:{i}"), b("⏩ End=Full", f"cf:{i}"), b(MODE_LABEL[job.mode].split(" (")[0], f"cm:{i}")],
-    ] + ([[b(f"📺 Quality: {'720p' if job.q == FALLBACK_HEIGHT else 'Best'}", f"cq:{i}")]]
-         if len(quality_options(job.src)) > 1 else []) + [
+    ] + ([[b(f"📺 Quality: {f'{job.q}p' if job.q else 'Auto'}", f"cq:{i}")]]
+         if len([h for h, _ in quality_options(job.src) if h]) > 1 else []) + [
         [b("✅ Cut + Download", f"cg:{i}")],
         [b("⬅️ Back", f"cx:{i}")],
     ])
@@ -1634,93 +1888,511 @@ async def run_delivery(client, job: Job, cut, audio=False):
         job.busy = False
 
 
-async def analyze_url(client, status_msg: Message, chat_id: int, url: str, reply_to=None, rng=None):
+START_TEXT = (
+    "👋 <b>Universal Video Downloader + Post Maker</b>\n\n"
+    "<b>1️⃣ Video download:</b> kisi website ka link bhejo. Har quality ka button milta hai, size upar likha hota hai. "
+    "Saath mein <b>✂️ Cut</b> aur <b>🎵 Audio</b>\n"
+    "<b>2️⃣ Post maker:</b> diskwala/terabox jaisa video link, Telegram link ya image/video/GIF ke saath link bhejo ya forward karo. "
+    "Bot wahi media wapas deta hai aur links quote mein sundar template ke saath. Kai links hon to Video 1, 2, 3…\n\n"
+    "🗣 Bina / ke seedha likho: <code>link 720p mein download</code>, <code>link 1:20 se 2:45 cut karo</code>, "
+    "<code>audio do</code>, <code>status</code>, <code>help</code>, <code>template 5</code>, <code>template random</code>\n"
+    "🤖 Command samajh na aaye tab Gemini kaam karta hai aur jawab deta hai\n"
+    "↩️ Sab kuch aapke message ka reply banke aata hai\n"
+    "🛡 18+ age-gate, cookie banner aur Cloudflare wait apne aap handle hote hain"
+)
+
+HELP_TEXT = (
+    "<b>📖 Kaise use karein</b>\n\n"
+    "<b>Video download</b>\n"
+    "• Link bhejo, quality ka button dabao (size upar likha hota hai)\n"
+    "• <b>✂️ Cut</b> keypad se, ya <code>link 1:20-2:45</code>\n"
+    "• <b>🎵 Audio</b> = sirf audio, 🖼 Thumbnail = HD image\n\n"
+    "<b>Post maker</b>\n"
+    "• Image/video/GIF ke saath diskwala/terabox + Telegram link bhejo ya forward karo\n"
+    "• Media wahi wapas aata hai, links quote mein, template random\n"
+    "• Kai video links = Video 1, Video 2… (sirf media ke saath). Bina media ke har link alag message\n"
+    "• <code>template 5</code> = fix, <code>template random</code> = wapas random\n\n"
+    "<b>Bina / ke commands:</b> <code>start</code>, <code>help</code>, <code>status</code>, "
+    "<code>720p mein bhejo</code>, <code>audio do</code>\n"
+    "<b>Login wali sites:</b> <code>cookies.txt</code> (Netscape format) bot folder mein rakho\n"
+    "<b>Server IP block ho to:</b> <code>PROXY_URL</code> env set karo"
+)
+
+
+def status_text():
+    return (f"📊 <b>Status</b>\n• Analyzing: <code>{analyzing}</code>\n"
+            f"• Active downloads: <code>{active_downloads}</code>")
+
+
+async def _allowed(_, __, update):
+    u = getattr(update, "from_user", None)
+    return not ALLOWED or bool(u and u.id in ALLOWED)
+
+allowed = filters.create(_allowed)
+
+
+def fail_text(err, diag):
+    lines = ["❌ <b>Video extract nahi ho paaya.</b>", f"<code>{esc((err or '')[:200])}</code>"]
+    cands = diag.get("cands") or []
+    if cands:
+        lines.append("\n🔎 <b>Ye links mile (sahi lage to button dabao):</b>")
+        for i, c in enumerate(cands[:5], 1):
+            lines.append(f"{i}. <code>{esc(c['url'][:140])}</code> ({c['kind']})")
+    net = diag.get("net") or []
+    if net:
+        lines.append("\n📡 <b>Network mein ye media requests dikhi:</b>")
+        lines += [f"<code>{esc(u[:140])}</code>" for u in net[:4]]
+    lines.append("\n💡 Direct video link ya webpage URL bhi bhej sakte ho, ya Gemini se pucho.")
+    return "\n".join(lines)[:3900]
+
+
+def fail_kb(fid, diag):
+    rows = []
+    for i, c in enumerate((diag.get("cands") or [])[:5]):
+        label = name_from_url(c["url"])[:22] or urlparse(c["url"]).netloc[:22]
+        rows.append([InlineKeyboardButton(f"▶️ {i + 1}. {c['kind'].upper()}  {label}", callback_data=f"tc:{fid}:{i}")])
+    rows.append([InlineKeyboardButton("🤖 Gemini se poochho", callback_data=f"gm:{fid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def dispatch_intent(client, job: Job, it: Intent, st):
+    D = job.src.duration
+    if it.q:
+        job.q = it.q
+    if it.action == "audio":
+        return spawn(run_delivery(client, job, None, True))
+    if it.action == "download":
+        return spawn(run_delivery(client, job, None))
+    if it.action == "cut":
+        if it.start is not None and it.end is not None and it.end > it.start and not (D and it.start >= D):
+            job.cs, job.ce = it.start, (min(it.end, D) if D else it.end)
+            if it.mode:
+                job.mode = it.mode
+            return spawn(run_delivery(client, job, (job.cs, job.ce, job.mode)))
+        job.cs, job.ce, job.sel, job.fresh = 0.0, D or 600.0, "s", True
+        return await st.edit_text(panel_text(job), reply_markup=panel_kb(job))
+    await st.edit_text(card_text(job), reply_markup=card_kb(job))
+
+
+async def finish_analysis(client, status_msg, chat_id, src, reply_to, intent):
+    job = Job(id=secrets.token_hex(4), chat_id=chat_id, src=src, msg=status_msg, reply_to=reply_to)
+    job.ce = src.duration or 600.0
+    JOBS[job.id] = job
+    LAST[chat_id] = job.id
+    await dispatch_intent(client, job, intent, status_msg)
+
+
+async def retry_failed(client, msg, f, act, arg):
+    loop = asyncio.get_running_loop()
+
+    async def status(text):
+        try:
+            await msg.edit_text(f"{text}\n<code>{esc(f['url'][:60])}</code>")
+        except Exception:
+            pass
+
+    try:
+        if act == "tc":
+            u = f["cands"][int(arg)]["url"]
+        else:
+            await status("🤖 Gemini se link nikal raha hoon…")
+            u = await loop.run_in_executor(None, gemini_find_url, f["url"], f.get("html"), f.get("net"), f.get("cands"))
+            if not u:
+                return await msg.edit_text("🤖 Gemini ko bhi video link nahi mila.\n\n" + fail_text("", f),
+                                           reply_markup=fail_kb(f["id"], f))
+        await status("🧪 Check kar raha hoon…")
+        src = await source_from_media(u, f["url"], f["cookies"], title=f.get("title"), thumbs=f.get("thumbs"))
+        await finish_analysis(client, msg, f["chat_id"], src, f["reply_to"], f["intent"])
+    except Exception as e:
+        logging.error(f"[retry] {e}")
+        try:
+            await msg.edit_text(f"❌ <code>{esc(str(e)[:200])}</code>\n\n" + fail_text("", f),
+                                reply_markup=fail_kb(f["id"], f))
+        except Exception:
+            pass
+
+
+async def analyze_url(client, status_msg: Message, chat_id: int, url: str, reply_to=None, intent=None, note=""):
     global analyzing
+    intent = intent or Intent()
     short = esc(url[:60])
 
     async def status(text):
         try:
-            await status_msg.edit_text(f"{text}\n<code>{short}</code>")
+            await status_msg.edit_text(f"{note}{text}\n<code>{short}</code>")
         except Exception:
             pass
 
     async with ANALYZE_SEM:
         analyzing += 1
         try:
-            src = await asyncio.wait_for(resolve_source(url, status), timeout=240)
-            job = Job(id=secrets.token_hex(4), chat_id=chat_id, src=src, msg=status_msg, reply_to=reply_to)
-            job.ce = src.duration or 600.0
-            JOBS[job.id] = job
-            D = src.duration
-            if rng and not (D and rng[0] >= D):
-                job.cs, job.ce = rng[0], (min(rng[1], D) if D else rng[1])
-                spawn(run_delivery(client, job, (job.cs, job.ce, job.mode)))
-            else:
-                await status_msg.edit_text(card_text(job), reply_markup=card_kb(job))
+            src = await asyncio.wait_for(resolve_source(url, status), timeout=300)
+            await finish_analysis(client, status_msg, chat_id, src, reply_to, intent)
         except Exception as e:
             logging.error(f"[analyze] {url}: {e}")
-            await status_msg.edit_text(
-                "❌ <b>Video extract nahi ho paaya.</b>\n\n"
-                "💡 Try karein:\n• Expired token link ki jagah <b>webpage URL</b> bhejein\n"
-                "• Login wali site ho to <code>cookies.txt</code> add karein\n"
-                f"\n<code>{esc(str(e)[:150])}</code>")
+            diag = getattr(e, "diag", None)
+            try:
+                if diag:
+                    fid = secrets.token_hex(4)
+                    FAILS[fid] = {**diag, "id": fid, "chat_id": chat_id, "reply_to": reply_to,
+                                  "intent": intent, "created": time.time()}
+                    await status_msg.edit_text(fail_text(str(e), diag), reply_markup=fail_kb(fid, diag))
+                else:
+                    await status_msg.edit_text(
+                        "❌ <b>Video extract nahi ho paaya.</b>\n\n"
+                        "💡 Try karein:\n• Expired token link ki jagah <b>webpage URL</b> bhejein\n"
+                        "• Login wali site ho to <code>cookies.txt</code> add karein\n"
+                        f"\n<code>{esc(str(e)[:150] or 'timeout')}</code>")
+            except Exception:
+                pass
         finally:
             analyzing -= 1
 
 
-@app.on_message(filters.command("start") & filters.private)
-async def start_cmd(_, message: Message):
-    await message.reply_text(
-        "👋 <b>Universal Video Downloader</b>\n\n"
-        "🔗 Link bhejo (ek message mein kai links bhi chalenge)\n"
-        "🧠 Analyze ke baad: <b>⬇️ 1080p+ / 720p</b> (size ke saath) / <b>Cut + Download</b> / <b>🎵 Audio</b>\n"
-        "✂️ Cut mein sirf cut hui video aati hai\n"
-        "⚡ Shortcut: link ke saath time likho, jaise <code>link 1:20-2:45</code> — seedha cut ho jayega\n"
-        "↩️ Video aur thumbnail aapke link wale message ka reply banke aate hain\n"
-        "🖼 Thumbnail button: ek HD image (original quality file)\n\n"
-        "⚡ Engines: yt-dlp → Browser → HTML scan → Gemini AI"
-    )
+TG_HOSTS = ("t.me", "telegram.me", "telegram.dog", "telesco.pe")
+FILEHOSTS = ("terabox", "diskwala", "mirrobox", "nephobox", "momerybox", "tibibox", "4funbox", "gibibox",
+             "terafileshare", "terasharelink", "teraboxlink", "teraboxurl", "teraboxshare", "mega.nz", "mediafire.com",
+             "gofile.io", "pixeldrain.com", "streamtape", "doodstream", "dood.", "mixdrop", "filemoon", "streamwish",
+             "vidhide", "krakenfiles", "1fichier", "drive.google.com", "dropbox.com", "mdisk")
+STYLES = [(0x1D400, 0x1D41A, 0x1D7CE), (0x1D5D4, 0x1D5EE, 0x1D7EC), (0x1D468, 0x1D482, 0x1D7CE),
+          (0x1D670, 0x1D68A, 0x1D7F6), (0x1D63C, 0x1D656, 0x1D7EC)]
+FRAMES = [("🦢✨", "✨🦢"), ("🔥", "🔥"), ("💎", "💎"), ("🌟", "🌟"), ("🎬", "🎬"), ("🚀", "🚀"), ("🌙", "🌙"),
+          ("⚡", "⚡"), ("👑", "👑"), ("🍿", "🍿"), ("🎞️", "🎞️"), ("🌸", "🌸"), ("💫", "💫"), ("🦋", "🦋"),
+          ("✨", "✨"), ("🎆", "🎆"), ("🪄", "🪄"), ("🧿", "🧿"), ("🌈", "🌈"), ("🏆", "🏆"), ("🔮", "🔮"), ("🦚", "🦚")]
+TITLES = ["EXCLUSIVE ANIMATION", "EXCLUSIVE VIDEO", "NEW UPLOAD", "FRESH DROP", "LATEST RELEASE", "PREMIUM UPLOAD",
+          "SPECIAL SHOW", "FULL VIDEO", "NEW EPISODE", "FRESH EPISODE", "TODAY'S SPECIAL", "TRENDING NOW",
+          "JUST ARRIVED", "MUST WATCH", "WEEKEND SPECIAL", "HOT UPDATE", "NEW ARRIVAL", "BRAND NEW",
+          "FEATURED VIDEO", "TOP PICK", "VIP UPLOAD", "DAILY DROP", "MIDNIGHT SPECIAL", "LIMITED RELEASE",
+          "EXCLUSIVE PREMIERE", "FULL HD UPLOAD", "HD VIDEO", "FRESH UPLOAD ALERT", "NEW RELEASE ALERT", "ONLY HERE"]
+SEPS = ["━" * 18, "─" * 16, "▬" * 12, "•┈┈┈┈•✦•┈┈┈┈•", "═" * 15, "✦━━━━━━━━━✦", "⋆⋅☆⋅⋆⋅☆⋅⋆⋅☆⋅⋆", "┄" * 14,
+        "▰▱" * 8, "•" * 18, "◈━━━━━━━━━━◈", "⟡" * 10, "━━━━ ✦ ━━━━", "〰️" * 8, "═══ ◆ ═══", "✧･ﾟ: *✧･ﾟ:* *:･ﾟ✧"]
+WATCH = [("🎬", "WATCH NOW", "👇🔥"), ("▶️", "WATCH HERE", "👇"), ("📺", "STREAM NOW", "👇✨"), ("🎥", "VIDEO LINK", "👇"),
+         ("🍿", "PLAY NOW", "👇🔥"), ("🎞️", "FULL VIDEO", "👇"), ("⬇️", "DOWNLOAD HERE", "👇"),
+         ("🔗", "GET THE VIDEO", "👇✨"), ("📽️", "WATCH FULL VIDEO", "👇"), ("💥", "CLICK TO WATCH", "👇")]
+PASS = [("🔐", "PASS LINK", "👇"), ("📢", "JOIN CHANNEL", "👇"), ("📣", "CHANNEL LINK", "👇🔔"), ("🔓", "UNLOCK PASS", "👇"),
+        ("🗝️", "ACCESS LINK", "👇"), ("💬", "MAIN CHANNEL", "👇"), ("🛡️", "BACKUP CHANNEL", "👇"),
+        ("🔔", "JOIN FOR UPDATES", "👇"), ("📌", "IMPORTANT LINK", "👇"), ("🎟️", "ENTRY PASS", "👇")]
+FOOT = [("❤️‍🔥", "ENJOY THE SHOW", ""), ("🍿", "HAPPY WATCHING", ""), ("💫", "ENJOY & SHARE", ""),
+        ("👋", "SEE YOU NEXT TIME", ""), ("🔔", "STAY TUNED", ""), ("🙏", "THANKS FOR WATCHING", ""),
+        ("🎉", "ENJOY", ""), ("🌟", "KEEP SUPPORTING", ""), ("💖", "LIKE & SHARE", ""), ("✨", "ENJOY THE VIDEO", "")]
+BULLETS = ["🔗", "➤", "▶️", "🌐", "👉", "📎", "🔸", "🔹", "▪️"]
+N_TPL = 999
+SAMPLE_VIDEO = "https://example.com/video-link"
+SAMPLE_TG = "https://t.me/+example"
 
 
-@app.on_message(filters.command("help") & filters.private)
-async def help_cmd(_, message: Message):
-    await message.reply_text(
-        "<b>📖 Kaise use karein</b>\n\n"
-        "1️⃣ Video page ka URL bhejo\n"
-        "2️⃣ Bot analyze karke length ke saath buttons dega\n"
-        "3️⃣ <b>⬇️ 1080p+</b> ya <b>⬇️ 720p</b> = full video (size button par likha hota hai), <b>🎵 Audio</b> = sirf audio (m4a)\n"
-        "4️⃣ <b>✂️ Cut</b> = keypad se Start/End time daalo, phir ✅ (sirf cut video aayegi)\n"
-        "5️⃣ Cut panel mein <b>📺 Quality</b> = Best / 720p\n"
-        "6️⃣ Video ke neeche <b>🖼 Thumbnail</b> dabao to HD thumbnail milega\n"
-        "7️⃣ Shortcut: <code>link 1:20-2:45</code> bhejo to seedha cut hoke aayegi\n\n"
-        "<b>Cut modes:</b> 🎯 Exact (frame-exact) • ⚡ Fast (keyframe pe, instant)\n"
-        "<b>Login wali sites:</b> browser se <code>cookies.txt</code> (Netscape format) bot folder mein rakho"
-    )
+def fancy(text, style):
+    A, a, d = style
+    out = []
+    for ch in text:
+        if "A" <= ch <= "Z":
+            out.append(chr(A + ord(ch) - 65))
+        elif "a" <= ch <= "z":
+            out.append(chr(a + ord(ch) - 97))
+        elif "0" <= ch <= "9":
+            out.append(chr(d + ord(ch) - 48))
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
-@app.on_message(filters.command("queue") & filters.private)
-async def queue_cmd(_, message: Message):
-    await message.reply_text(
-        f"📊 <b>Status</b>\n• Analyzing: <code>{analyzing}</code>\n• Active downloads: <code>{active_downloads}</code>"
-    )
+def tpl(idx):
+    if idx == 1:
+        return dict(st=STYLES[0], fl="🦢✨", fr="✨🦢", title="EXCLUSIVE ANIMATION", sep="━" * 18,
+                    w=("🎬", "WATCH NOW", "👇🔥"), p=("🔐", "PASS LINK", "👇"), f=("🍑", "ENJOY THE SHOW", "❤️‍🔥"), b="🔗")
+    r = random.Random(idx * 7919 + 13)
+    fl, fr = r.choice(FRAMES)
+    return dict(st=r.choice(STYLES), fl=fl, fr=fr, title=r.choice(TITLES), sep=r.choice(SEPS),
+                w=r.choice(WATCH), p=r.choice(PASS), f=r.choice(FOOT), b=r.choice(BULLETS))
 
 
-@app.on_message(filters.private & filters.regex(r"https?://"))
-async def url_handler(client, message: Message):
+def quote(x):
+    return f"<blockquote>{x}</blockquote>" if QUOTE_OK else f"<code>{x}</code>"
+
+
+def plain_len(x):
+    return len(html.unescape(re.sub(r"<[^>]+>", "", x)).encode("utf-16-le")) // 2
+
+
+def _lab(t, tup):
+    pre, text, suf = tup
+    return f"{pre} {esc(fancy(text, t['st']))}" + (f" {suf}" if suf else "")
+
+
+def pack(t, vids, tgs, first_limit):
+    multi = len(vids) > 1
+    head = f"{t['fl']} {esc(fancy(t['title'], t['st']))} {t['fr']}\n{t['sep']}\n{_lab(t, t['w'])}"
+    items = [head]
+    for i, u in enumerate(vids, 1):
+        q = quote(f"{t['b']} {esc(u)}")
+        items.append(f"{fancy(f'Video {i}', t['st'])}\n{q}" if multi else q)
+    tail = [t["sep"]]
+    if tgs:
+        tail += [_lab(t, t["p"]), quote("\n".join(f"{t['b']} {esc(u)}" for u in tgs)), t["sep"]]
+    tail.append(_lab(t, t["f"]))
+    items.append("\n".join(tail))
+    chunks, cur, lim = [], "", first_limit
+    for it in items:
+        cand = f"{cur}\n{it}" if cur else it
+        if cur and plain_len(cand) > lim:
+            chunks.append(cur)
+            cur, lim = it, 4096
+        else:
+            cur = cand
+    chunks.append(cur)
+    return chunks
+
+
+async def detect_quote():
+    global QUOTE_OK
+    try:
+        from pyrogram.parser import Parser
+        r = await Parser(app).parse("<blockquote>x</blockquote>", enums.ParseMode.HTML)
+        QUOTE_OK = any("Blockquote" in type(e).__name__ for e in (r.get("entities") or []))
+    except Exception as e:
+        logging.info(f"[quote] check skipped: {e}")
+    logging.info(f"[quote] blockquote support: {QUOTE_OK}")
+
+
+async def safe(fn, *a, **k):
+    for _ in range(3):
+        try:
+            return await fn(*a, **k)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+    return await fn(*a, **k)
+
+
+def is_tg(u):
+    return urlparse(u).netloc.lower().split(":")[0] in TG_HOSTS
+
+
+def is_filehost(u):
+    host = urlparse(u).netloc.lower()
+    return any(k in host for k in FILEHOSTS)
+
+
+def extract_urls(message):
     text = message.text or message.caption or ""
-    urls = list(dict.fromkeys(u.rstrip(").,;]") for u in URL_REGEX.findall(text)))[:10]
+    ents = message.entities or message.caption_entities or []
+    found = [(m.start(), m.group(0).rstrip(").,;]")) for m in URL_REGEX.finditer(text)]
+    for e in ents:
+        u = getattr(e, "url", None)
+        if u and u.startswith("http"):
+            found.append((e.offset, u))
+    out = []
+    for _, u in sorted(found, key=lambda x: x[0]):
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def media_of(m):
+    for kind in ("photo", "animation", "video", "document"):
+        obj = getattr(m, kind, None)
+        if obj:
+            return kind, obj.file_id
+    return None, None
+
+
+def route_mode(text, urls, kind):
+    if kind:
+        return "post" if urls else "nolink"
     if not urls:
+        return "chat" if (text or "").strip() else "skip"
+    rest = URL_REGEX.sub(" ", text or "").strip()
+    if rule_intent(rest, True).action in ("cut", "audio", "download"):
+        return "dl"
+    if any(is_tg(u) or is_filehost(u) for u in urls):
+        return "post"
+    return "dl"
+
+
+async def send_chunks(client, message, kind, fid, chunks):
+    chat, rid = message.chat.id, message.id
+    first, rest = chunks[0], chunks[1:]
+    if kind:
+        sender = {"photo": client.send_photo, "animation": client.send_animation,
+                  "video": client.send_video, "document": client.send_document}[kind]
+        fits = plain_len(first) <= 1024
+        await safe(sender, chat, fid, caption=first if fits else "", reply_to_message_id=rid)
+        if not fits:
+            rest = [first] + rest
+    else:
+        await safe(client.send_message, chat, first, reply_to_message_id=rid, disable_web_page_preview=True)
+    for c in rest:
+        await asyncio.sleep(0.7)
+        await safe(client.send_message, chat, c, reply_to_message_id=rid, disable_web_page_preview=True)
+
+
+def split_links(urls):
+    return [u for u in urls if not is_tg(u)][:MAX_POST_LINKS], [u for u in urls if is_tg(u)][:6]
+
+
+def pick_tpl(chat_id):
+    return tpl(PREFS.get(chat_id) or random.randint(1, N_TPL))
+
+
+async def post_message(client, message, urls, kind, fid):
+    vids, tgs = split_links(urls)
+    if not vids:
+        return await safe(message.reply_text, "🎬 Video link nahi mila, sirf Telegram link hai.", quote=True)
+    t = pick_tpl(message.chat.id)
+    if kind:
+        return await send_chunks(client, message, kind, fid, pack(t, vids, tgs, 1024))
+    for i, u in enumerate(vids):
+        if i:
+            await asyncio.sleep(0.7)
+        await send_chunks(client, message, None, None, pack(t, [u], tgs, 4096))
+
+
+async def album_post(client, message):
+    chat, key, now = message.chat.id, (message.chat.id, message.media_group_id), time.time()
+    for k in [k for k, v in ALBUMS.items() if now - v > 120]:
+        ALBUMS.pop(k, None)
+    if key in ALBUMS:
         return
-    rng = parse_range(URL_REGEX.sub(" ", text))
+    ALBUMS[key] = now
+    await asyncio.sleep(1.2)
+    group = sorted(await client.get_media_group(chat, message.id), key=lambda m: m.id)
+    urls = []
+    for m in group:
+        for u in extract_urls(m):
+            if u not in urls:
+                urls.append(u)
+    vids, tgs = split_links(urls)
+    if not vids:
+        return await safe(message.reply_text, "🔗 Is album mein video link nahi mila.", quote=True)
+    chunks = pack(pick_tpl(chat), vids, tgs, 1024)
+    cls = {"photo": InputMediaPhoto, "video": InputMediaVideo, "document": InputMediaDocument}
+    metas = [(k, f) for k, f in (media_of(m) for m in group) if k in cls]
+    if not metas:
+        return await send_chunks(client, message, None, None, chunks)
+    fits = plain_len(chunks[0]) <= 1024
+    media = [cls[k](f, caption=chunks[0] if (i == 0 and fits) else "", parse_mode=enums.ParseMode.HTML)
+             for i, (k, f) in enumerate(metas)]
+    await safe(client.send_media_group, chat, media, reply_to_message_id=message.id)
+    for c in (chunks[1:] if fits else chunks):
+        await asyncio.sleep(0.7)
+        await safe(client.send_message, chat, c, reply_to_message_id=message.id, disable_web_page_preview=True)
+
+
+async def template_reply(message, arg):
+    chat = message.chat.id
+    if arg.isdigit() and arg != "0":
+        n = int(arg)
+        if not 1 <= n <= N_TPL:
+            return await safe(message.reply_text, f"🎨 Template number 1 se {N_TPL} ke beech likho.", quote=True)
+        PREFS[chat] = n
+        head = f"✅ Template <code>{n}</code> set. Ab har post isi style mein aayegi.\n\n"
+    elif arg == "0":
+        PREFS.pop(chat, None)
+        head = "🎲 Random template mode on.\n\n"
+    else:
+        head = (f"🎨 <b>{N_TPL} templates</b> hain. <code>template 5</code> likho fix karne ke liye, "
+                f"<code>template random</code> se wapas random. Sample:\n\n")
+    sample = "\n".join(pack(tpl(PREFS.get(chat) or random.randint(1, N_TPL)), [SAMPLE_VIDEO], [SAMPLE_TG], 4096))
+    await safe(message.reply_text, head + sample, quote=True, disable_web_page_preview=True)
+
+
+async def misc_reply(message: Message, it: Intent) -> bool:
+    if it.action == "status":
+        await message.reply_text(status_text(), quote=True)
+    elif it.action == "help":
+        await message.reply_text(HELP_TEXT, quote=True)
+    elif it.action == "start":
+        await message.reply_text(START_TEXT, quote=True)
+    elif it.action == "template":
+        await template_reply(message, it.arg)
+    elif it.action in ("ask", "chat"):
+        await message.reply_text(f"🤖 {esc(it.reply or 'Samajh nahi aaya, thoda aur batao.')}", quote=True)
+    else:
+        return False
+    return True
+
+
+async def download_message(client, message, text, urls):
+    urls = urls[:10]
+    it = await get_intent(URL_REGEX.sub(" ", text).strip(), True, "")
+    if it.action in ("status", "help", "start", "template", "ask") and await misc_reply(message, it):
+        return
+    note = f"🤖 {esc(it.reply)}\n\n" if it.reply else ""
     for u in urls:
-        st = await message.reply_text(f"🔍 <b>Analyzing…</b>\n<code>{esc(u[:60])}</code>", quote=True)
-        spawn(analyze_url(client, st, message.chat.id, u, message.id, rng))
+        st = await message.reply_text(f"{note}🔍 <b>Analyzing…</b>\n<code>{esc(u[:60])}</code>", quote=True)
+        spawn(analyze_url(client, st, message.chat.id, u, message.id, it, note))
 
 
-@app.on_callback_query()
+async def chat_message(client, message, text):
+    job = JOBS.get(LAST.get(message.chat.id))
+    it = await get_intent(text, False, job.src.title if job else "")
+    if await misc_reply(message, it):
+        return
+    if not job:
+        return await message.reply_text("🔗 Pehle video ka link bhejo.", quote=True)
+    if it.action == "none":
+        return await message.reply_text(
+            "🤖 Samajh nahi aaya. Aise likho: <code>720p mein download</code>, <code>audio do</code>, "
+            "<code>1:20 se 2:45 cut karo</code>, <code>help</code>", quote=True)
+    if job.busy:
+        return await message.reply_text("⏳ Pichla kaam abhi chal raha hai.", quote=True)
+    note = f"🤖 {esc(it.reply)}\n\n" if it.reply else ""
+    st = await message.reply_text(f"{note}⏳ Shuru kar raha hoon…", quote=True)
+    job.msg = st
+    await dispatch_intent(client, job, it, st)
+
+
+@app.on_message(filters.command("start") & filters.private & allowed)
+async def start_cmd(_, message: Message):
+    await message.reply_text(START_TEXT)
+
+
+@app.on_message(filters.command("help") & filters.private & allowed)
+async def help_cmd(_, message: Message):
+    await message.reply_text(HELP_TEXT)
+
+
+@app.on_message(filters.command("queue") & filters.private & allowed)
+async def queue_cmd(_, message: Message):
+    await message.reply_text(status_text())
+
+
+@app.on_message(filters.private & allowed & ~filters.command(["start", "help", "queue"]))
+async def router(client, message: Message):
+    try:
+        if message.media_group_id:
+            return await album_post(client, message)
+        text = message.text or message.caption or ""
+        urls = extract_urls(message)
+        kind, fid = media_of(message)
+        mode = route_mode(text, urls, kind)
+        if mode == "post":
+            await post_message(client, message, urls, kind, fid)
+        elif mode == "dl":
+            await download_message(client, message, text, urls)
+        elif mode == "nolink":
+            await safe(message.reply_text, "🔗 Is message mein koi link nahi mila.", quote=True)
+        elif mode == "chat":
+            await chat_message(client, message, text)
+    except Exception as e:
+        logging.exception("router failed")
+        try:
+            await message.reply_text(f"❌ <code>{esc(str(e)[:200])}</code>", quote=True)
+        except Exception:
+            pass
+
+
+@app.on_callback_query(allowed)
 async def on_callback(client, cq: CallbackQuery):
     parts = (cq.data or "").split(":")
     act = parts[0]
+    if act in ("tc", "gm"):
+        f = FAILS.get(parts[1]) if len(parts) > 1 else None
+        if not f:
+            return await cq.answer("⌛ Ye request purani ho gayi — link dobara bhejo.", show_alert=True)
+        if act == "gm" and not ai_model:
+            return await cq.answer("⚠️ Gemini key set nahi hai (GEMINI_API_KEY)", show_alert=True)
+        await cq.answer("⏳ Check kar raha hoon…")
+        return spawn(retry_failed(client, cq.message, f, act, parts[2] if len(parts) > 2 else ""))
     job = JOBS.get(parts[1]) if len(parts) > 1 else None
     if not job:
         return await cq.answer("⌛ Ye request purani ho gayi — link dobara bhejo.", show_alert=True)
@@ -1790,7 +2462,8 @@ async def on_callback(client, cq: CallbackQuery):
     elif act == "cm":
         job.mode = "fast" if job.mode == "exact" else "exact"
     elif act == "cq":
-        job.q = MAX_HEIGHT if job.q == FALLBACK_HEIGHT else FALLBACK_HEIGHT
+        cyc = [0] + [h for h, _ in quality_options(job.src) if h]
+        job.q = cyc[(cyc.index(job.q) + 1) % len(cyc)] if job.q in cyc else 0
     await cq.answer()
     await refresh()
 
@@ -1805,28 +2478,5 @@ async def janitor():
                 for f in os.listdir(THUMB_DIR):
                     if f.startswith(jid + "_"):
                         _rm(os.path.join(THUMB_DIR, f))
-        for d in os.listdir(DOWNLOAD_DIR):
-            p = os.path.join(DOWNLOAD_DIR, d)
-            if os.path.isdir(p) and now - os.path.getmtime(p) > 4 * 3600:
-                shutil.rmtree(p, ignore_errors=True)
-
-
-async def main():
-    global ANALYZE_SEM, DL_SEM
-    ANALYZE_SEM = asyncio.Semaphore(MAX_CONCURRENT)
-    DL_SEM = asyncio.Semaphore(MAX_CONCURRENT)
-    for d in os.listdir(DOWNLOAD_DIR):
-        shutil.rmtree(os.path.join(DOWNLOAD_DIR, d), ignore_errors=True)
-    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
-        logging.error("❌ ffmpeg/ffprobe install nahi hai! (apt install ffmpeg)")
-    await app.start()
-    logging.info("🚀 Bot started")
-    spawn(janitor())
-    try:
-        await idle()
-    finally:
-        await app.stop()
-
-
-if __name__ == "__main__":
-    app.run(main())
+        for fid, f in list(FAILS.items()):
+            if now - f["cr
