@@ -109,18 +109,15 @@ TIME_PAT = r"\d{1,2}(?::\d{1,2}){1,2}"
 RANGE_RE = re.compile(rf"(?<![\d:])({TIME_PAT})\s*(?:-|–|—|to|se)\s*({TIME_PAT})(?![\d:])", re.I)
 
 # ---------- anti-spam state ----------
-URL_DEDUP = {}        # chat_id -> {url: ts}   duplicate URL block
-MSG_RATE = {}         # chat_id -> [ts,...]   per-chat rate limit
-MISC_COOLDOWN = {}    # (chat_id, key) -> ts  cooldown for start/help/status/chat
-LAST_REPLY = {}       # chat_id -> text       avoid identical chat replies
-BOT_MSG_TS = {}       # chat_id -> ts         last bot outgoing msg time
+URL_DEDUP = {}
+MSG_RATE = {}
+MISC_COOLDOWN = {}
+LAST_REPLY = {}
 
 
 def _dedup_url(chat_id, url, window=90):
-    """Return True if this URL is fresh (not seen recently for this chat)."""
     now = time.time()
     d = URL_DEDUP.get(chat_id) or {}
-    # purge old
     d = {u: t for u, t in d.items() if now - t < window}
     URL_DEDUP[chat_id] = d
     if url in d:
@@ -130,7 +127,6 @@ def _dedup_url(chat_id, url, window=90):
 
 
 def _rate_ok(chat_id, max_msgs=12, window=15):
-    """Return True if chat is under its message rate limit."""
     now = time.time()
     times = [t for t in MSG_RATE.get(chat_id, []) if now - t < window]
     if len(times) >= max_msgs:
@@ -142,7 +138,6 @@ def _rate_ok(chat_id, max_msgs=12, window=15):
 
 
 def _cooldown_ok(chat_id, key, seconds=20):
-    """Return True if the cooldown for (chat_id, key) has expired."""
     now = time.time()
     k = (chat_id, key)
     if now - MISC_COOLDOWN.get(k, 0) < seconds:
@@ -182,6 +177,7 @@ UNIVERSAL_SELECTORS = [
     'a[href*="download"]', 'a:has-text("1080p")', 'a:has-text("720p")',
     'a:has-text("MP4")', 'a:has-text("Download")', 'a[download]',
     '.download-button', '.btn-download', '#download', '#btn-download',
+    'source[src*=".mp4"]', 'source[src*=".m3u8"]', 'video source',
 ]
 PLAY_SELECTORS = [
     '.vjs-big-play-button', '.jw-icon-display', '.plyr__control--overlaid',
@@ -346,6 +342,7 @@ def make_headers(page_url: str, origin: bool = True) -> dict:
     h = {
         "User-Agent": UA, "Referer": page_url, "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Site": "same-origin",
     }
     if origin:
         h["Origin"] = origin_of(page_url)
@@ -587,6 +584,37 @@ def ensure_compatible(path, on_progress=None):
     run_ffmpeg(args + ["-movflags", "+faststart", out], info["duration"], on_progress)
     _rm(path)
     return out
+
+
+def enforce_quality(path, max_h, workdir, prog=None):
+    """If user requested specific height and file is larger, downscale with ffmpeg."""
+    try:
+        mh = int(max_h or 0)
+    except Exception:
+        mh = 0
+    if not mh or mh >= 4300:
+        return path
+    info = ffprobe(path)
+    if not info:
+        return path
+    short = info.get("short") or 0
+    if not short or short <= mh + 40:
+        return path
+    logging.info(f"[quality] enforcing {mh}p on {short}p source")
+    out = os.path.join(workdir, f"q{mh}.mp4")
+    scale = f"scale=-2:{mh}:force_original_aspect_ratio=decrease"
+    args = ["-i", path, "-vf", scale,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out]
+    cb = (lambda c, t: prog.update(f"📐 {mh}p bana raha hoon", c, t, "time")) if prog else None
+    try:
+        run_ffmpeg(args, info["duration"], cb)
+        if os.path.exists(out) and os.path.getsize(out) > 100 * 1024:
+            _rm(path)
+            return out
+    except Exception as e:
+        logging.warning(f"[quality] enforce failed: {e}")
+    return path
 
 
 def _venc(info, crf):
@@ -832,9 +860,12 @@ class Progress:
 def base_ydl_opts(headers=None, fast=False):
     h = dict(headers or {})
     h.setdefault("User-Agent", UA)
+    h.setdefault("Accept-Language", "en-US,en;q=0.9")
     o = {
         "quiet": True, "no_warnings": True, "noplaylist": True, "nocheckcertificate": True,
-        "socket_timeout": 10 if fast else 30, "retries": 1 if fast else 5, "fragment_retries": 10, "http_headers": h,
+        "socket_timeout": 15 if fast else 30, "retries": 3, "fragment_retries": 15, "http_headers": h,
+        "geo_bypass": True, "cachedir": False, "extractor_retries": 3,
+        "file_access_retries": 3, "retry_sleep_functions": {"http": lambda n: min(2 ** n, 20)},
     }
     if os.path.exists(COOKIES_FILE):
         o["cookiefile"] = COOKIES_FILE
@@ -969,6 +1000,8 @@ def scan_html_for_media(text, base):
         found.append(m.group(0))
     for m in re.finditer(r'["\'](/[^"\'\s<>\\]+?\.(?:m3u8|mp4|webm|mpd)(?:\?[^"\'\s<>\\]*)?)["\']', text, re.I):
         found.append(m.group(1))
+    for m in re.finditer(r'(?:file|src|source|video_url|videoUrl|play_url|playUrl)["\']?\s*[:=]\s*["\']([^"\']+\.(?:m3u8|mp4|mpd|webm)[^"\']*)["\']', text, re.I):
+        found.append(m.group(1))
     out, seen = [], set()
     for u in found:
         a = urljoin(base, u)
@@ -1012,10 +1045,10 @@ async def sniff_page(page_url, cookies):
                 except ValueError:
                     pass
             rt = resp.request.resource_type
-            if rt in ("xhr", "fetch") and total < 2 * MiB and ("json" in ctype or "text" in ctype or "javascript" in ctype):
+            if rt in ("xhr", "fetch") and total < 3 * MiB and ("json" in ctype or "text" in ctype or "javascript" in ctype):
                 try:
                     body = await resp.text()
-                    for u in scan_html_for_media(body, url)[:8]:
+                    for u in scan_html_for_media(body, url)[:10]:
                         add(u, 170, classify_media(u) or "mp4", 0, "API")
                 except Exception:
                     pass
@@ -1069,24 +1102,16 @@ async def sniff_page(page_url, cookies):
             except Exception:
                 pass
 
-            async def route(r):
-                if r.request.resource_type in ("image", "font"):
-                    await r.abort()
-                else:
-                    await r.continue_()
-            await ctx.route("**/*", route)
-
             page = await ctx.new_page()
             page.on("response", on_response)
-            ctx.on("page", lambda pg: asyncio.ensure_future(pg.close()))
 
             try:
-                await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+                await page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
                 logging.warning(f"[browser] goto: {e}")
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2000)
 
-            async def click_first(frame, selectors, timeout=1200):
+            async def click_first(frame, selectors, timeout=1500):
                 for sel in selectors:
                     try:
                         el = await frame.query_selector(sel)
@@ -1107,13 +1132,13 @@ async def sniff_page(page_url, cookies):
                         pass
                 return hit
 
-            for _ in range(10):
+            for _ in range(12):
                 try:
                     tl = (await page.title() or "").lower()
                 except Exception:
                     break
                 if any(k in tl for k in ("just a moment", "attention required", "checking your browser", "verify you are human")):
-                    await page.wait_for_timeout(1500)
+                    await page.wait_for_timeout(1800)
                 else:
                     break
             await click_first(page, CONSENT_SELECTORS)
@@ -1121,7 +1146,7 @@ async def sniff_page(page_url, cookies):
                 if not await age_pass():
                     break
                 await page.wait_for_timeout(900)
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(700)
 
             try:
                 res["title"] = await page.evaluate(
@@ -1134,7 +1159,7 @@ async def sniff_page(page_url, cookies):
                 res["thumbs"] = await page.evaluate(
                     """()=>{const r=[];document.querySelectorAll('meta[property="og:image"],meta[name="twitter:image"]')
                     .forEach(m=>m.content&&r.push(m.content));document.querySelectorAll('video[poster]')
-                    .forEach(v=>r.push(v.poster));return r}""")
+                    .forEach(v=>v.poster);return r}""")
             except Exception:
                 pass
 
@@ -1145,9 +1170,9 @@ async def sniff_page(page_url, cookies):
                         els = await page.query_selector_all(sel)
                     except Exception:
                         continue
-                    for el in els[:40]:
+                    for el in els[:60]:
                         try:
-                            href = await el.get_attribute("href")
+                            href = await el.get_attribute("href") or await el.get_attribute("src")
                             if not href:
                                 continue
                             u = urljoin(page.url, href)
@@ -1180,14 +1205,14 @@ async def sniff_page(page_url, cookies):
                     await click_first(fr, PLAY_SELECTORS, 1500)
 
             t0, pokes = time.time(), 0
-            while time.time() - t0 < 12:
+            while time.time() - t0 < 20:
                 if any(c["score"] >= 250 for c in cands.values()):
                     break
                 el = time.time() - t0
-                if (pokes == 0 and el > 0.3) or (pokes == 1 and el > 4.5):
+                if (pokes == 0 and el > 0.5) or (pokes == 1 and el > 5.0) or (pokes == 2 and el > 11.0):
                     await poke()
                     pokes += 1
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(600)
 
             if not cands:
                 await collect_links()
@@ -1200,7 +1225,7 @@ async def sniff_page(page_url, cookies):
                         k = classify_media(u) or "mp4"
                         add(u, 120, k, 0, "HTML")
                 try:
-                    dom = await page.evaluate("""()=>{const r=[];document.querySelectorAll('video,video source')
+                    dom = await page.evaluate("""()=>{const r=[];document.querySelectorAll('video,video source,source')
                         .forEach(v=>{if(v.src)r.push(v.src);if(v.currentSrc)r.push(v.currentSrc)});return r}""")
                     for u in dom or []:
                         if u.startswith("http"):
@@ -1214,7 +1239,7 @@ async def sniff_page(page_url, cookies):
                         el = await page.query_selector(sel)
                         if not el:
                             continue
-                        async with page.expect_download(timeout=4000) as dli:
+                        async with page.expect_download(timeout=5000) as dli:
                             await el.click()
                         dl = await dli.value
                         add(dl.url, 400, "mp4", 0, "DL")
@@ -1407,6 +1432,16 @@ async def resolve_source(url, status):
         err = str(e)[:300]
         logging.info(f"[yt-dlp] {err[:150]}")
 
+    # try with cookies via yt-dlp if plain failed
+    if not generic and os.path.exists(COOKIES_FILE):
+        try:
+            hdr = make_headers(url)
+            info = await run(ytdlp_extract, url, hdr)
+            if info and info.get("formats"):
+                return source_from_ytinfo(url, info, hdr, cookies)
+        except Exception:
+            pass
+
     await status("🌐 Browser se video dhoondh raha hoon…")
     sn = await sniff_page(url, cookies)
     cookies2 = sn["cookies"] or cookies
@@ -1427,7 +1462,7 @@ async def resolve_source(url, status):
         sc.thumbs += thumbs
         return sc
 
-    tasks = [try_yt(f, None) for f in sn["frames"][:4]]
+    tasks = [try_yt(f, None) for f in sn["frames"][:5]]
     ck = cookie_header(url, cookies2)
     if ck:
         tasks.append(try_yt(url, ck))
@@ -1441,7 +1476,7 @@ async def resolve_source(url, status):
         try:
             sc = make_session(make_headers(url), cookies)
             txt = (await run(lambda: sc.get(url, timeout=25).text))[:600000]
-            for u in scan_html_for_media(txt, url)[:5]:
+            for u in scan_html_for_media(txt, url)[:8]:
                 cands.append({"url": u, "score": 100, "kind": classify_media(u) or "mp4", "size": 0, "tag": "RAW"})
         except Exception as e:
             logging.info(f"[html-scan] {e}")
@@ -1491,13 +1526,33 @@ def _largest_media_file(workdir):
 
 
 def ytdlp_download(url, workdir, headers, max_h, prog, audio=False):
+    """Download via yt-dlp with HARD height filter — quality user bol de wahi aayegi."""
     def hook(d):
         if d.get("status") == "downloading":
             prog.update("⬇️ Downloading", d.get("downloaded_bytes") or 0,
                         d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
 
-    sort = [f"res:{max_h}", "vcodec:h264", "proto", "acodec:aac", "ext:mp4:m4a"]
-    plans = (("ba/b", None), ("b", None)) if audio else (("bv*+ba/b", sort), ("b/bv*+ba", None))
+    try:
+        h = int(max_h or 0)
+    except Exception:
+        h = 0
+
+    if audio:
+        plans = [("ba/b", None), ("b", None)]
+    elif h and h < 4300:
+        # HARD filter — 720p maangi to 720p hi aayegi, 1080p kabhi nahi
+        plans = [
+            (f"bv*[height<={h}]+ba/b[height<={h}]/bv*[height<={h}]+ba",
+             [f"res:{h}", "vcodec:h264", "proto", "acodec:aac", "ext:mp4:m4a"]),
+            (f"b[height<={h}]/w[height<={h}]/bv*[height<={h}]+ba", None),
+            (f"bv*[height<={h}]+ba/b", None),
+        ]
+    else:
+        plans = [
+            ("bv*+ba/b", ["vcodec:h264", "proto", "acodec:aac", "ext:mp4:m4a"]),
+            ("b/bv*+ba", None),
+        ]
+
     last = None
     for fmt, srt in plans:
         opts = base_ydl_opts(headers)
@@ -1511,12 +1566,19 @@ def ytdlp_download(url, workdir, headers, max_h, prog, audio=False):
             opts["format_sort"] = srt
         try:
             ydl_call(opts, lambda y: y.extract_info(url, download=True))
-            return _largest_media_file(workdir)
+            p = _largest_media_file(workdir)
+            try:
+                inf = ffprobe(p)
+                logging.info(f"[ytdlp] requested<={h}p  got={inf.get('short')}p  size={humanbytes(os.path.getsize(p))}")
+            except Exception:
+                pass
+            return p
         except Exception as e:
             last = e
+            logging.info(f"[ytdlp] plan failed ({fmt[:40]}…): {str(e)[:120]}")
             for f in os.listdir(workdir):
                 _rm(os.path.join(workdir, f))
-    raise last
+    raise last if last else RuntimeError("yt-dlp fail")
 
 
 def ffmpeg_stream_download(url, out, headers, duration, prog, hls=False):
@@ -1533,20 +1595,33 @@ def ffmpeg_stream_download(url, out, headers, duration, prog, hls=False):
     return out
 
 
-def download_direct(url, out_path, headers, cookies, prog, workers=8):
-    s = make_session(headers, cookies)
+def download_direct(url, out_path, headers, cookies, prog, workers=8, cookie_str=""):
+    """Download direct MP4. Falls back to cookies on 403."""
+    hdrs = dict(headers or {})
+    if cookie_str:
+        hdrs["Cookie"] = cookie_str
+    s = make_session(hdrs, cookies)
     label = "⬇️ Downloading"
 
     def first_request():
         try:
-            r = s.get(url, headers={"Range": "bytes=0-"}, stream=True, timeout=(15, 60), allow_redirects=True)
+            r = s.get(url, headers={"Range": "bytes=0-", **({"Cookie": cookie_str} if cookie_str else {})},
+                      stream=True, timeout=(15, 90), allow_redirects=True)
             if r.status_code >= 400:
                 raise IOError(f"HTTP {r.status_code}")
             return r
         except Exception:
-            return s.get(url, stream=True, timeout=(15, 60), allow_redirects=True)
+            return s.get(url, stream=True, timeout=(15, 90), allow_redirects=True)
 
     r = first_request()
+    if r.status_code == 403 and not cookie_str and cookies:
+        try:
+            r.close()
+        except Exception:
+            pass
+        cs = cookie_header(url, cookies)
+        if cs:
+            return download_direct(url, out_path, headers, cookies, prog, workers, cs)
     r.raise_for_status()
     ctype = (r.headers.get("content-type") or "").lower()
     if ctype.startswith("image/"):
@@ -1565,7 +1640,7 @@ def download_direct(url, out_path, headers, cookies, prog, workers=8):
             return out_path
         except Exception as e:
             logging.warning(f"[direct] parallel fail ({e}) -> single stream")
-            r = s.get(url, stream=True, timeout=(15, 60), allow_redirects=True)
+            r = s.get(url, stream=True, timeout=(15, 90), allow_redirects=True)
             r.raise_for_status()
 
     done = 0
@@ -1592,7 +1667,7 @@ def _parallel_download(session, url, out_path, total, workers, cb):
         last = None
         for attempt in range(4):
             try:
-                resp = session.get(url, headers={"Range": f"bytes={a}-{b}"}, stream=True, timeout=(15, 60))
+                resp = session.get(url, headers={"Range": f"bytes={a}-{b}"}, stream=True, timeout=(15, 90))
                 if resp.status_code != 206:
                     raise IOError(f"range unsupported ({resp.status_code})")
                 got = 0
@@ -1629,6 +1704,7 @@ def choose_tier(src: Source, q: int = 0) -> int:
 
 
 def download_media(src: Source, workdir, prog, q=0, audio=False):
+    """Try yt-dlp → direct → ffmpeg stream. Quality hard-filter respected for yt-dlp."""
     tier = choose_tier(src, q)
     errs = []
     if src.mode == "ytdlp":
@@ -1638,7 +1714,9 @@ def download_media(src: Source, workdir, prog, q=0, audio=False):
             errs.append(f"yt-dlp: {str(e)[:150]}")
     else:
         try:
-            return download_direct(src.dl_url, os.path.join(workdir, "dl.mp4"), src.headers, src.cookies, prog)
+            cs = src.headers.get("Cookie", "")
+            return download_direct(src.dl_url, os.path.join(workdir, "dl.mp4"), src.headers, src.cookies, prog,
+                                   cookie_str=cs)
         except Exception as e:
             errs.append(f"direct: {str(e)[:150]}")
         try:
@@ -1792,6 +1870,9 @@ def stage_a(job: Job, cut, workdir, prog: Progress, audio=False):
                                    lambda c, t: prog.update("🎵 Converting", c, t, "time"))
         return {"audio": out, "info": ainfo, "dur": ainfo.get("duration") or src.duration, "cut": None}
     path = ensure_compatible(path, lambda c, t: prog.update("🔧 Converting", c, t, "time"))
+    # quality enforce — user ne 720p bola to 720p hi milegi
+    if job.q and job.q < 4300:
+        path = enforce_quality(path, job.q, workdir, prog)
     info = ffprobe(path) or {}
     D = info.get("duration") or src.duration or 0
     out = {"full": path, "info": info, "dur": D, "cut": None, "audio": None}
@@ -1948,7 +2029,8 @@ HELP_TEXT = (
     "<b>Video download</b>\n"
     "• Link bhejo, quality ka button dabao (size upar likha hota hai)\n"
     "• <b>✂️ Cut</b> keypad se, ya <code>link 1:20-2:45</code>\n"
-    "• <b>🎵 Audio</b> = sirf audio, 🖼 Thumbnail = HD image\n\n"
+    "• <b>🎵 Audio</b> = sirf audio, 🖼 Thumbnail = HD image\n"
+    "• <b>720p/1080p</b> maango to wahi milega (upscale nahi hoga)\n\n"
     "<b>Post maker</b>\n"
     "• Image/video/GIF ke saath diskwala/terabox + Telegram link bhejo ya forward karo\n"
     "• Media wahi wapas aata hai, links quote mein, template random\n"
@@ -2411,7 +2493,6 @@ async def misc_reply(message: Message, it: Intent) -> bool:
         await template_reply(message, it.arg)
     elif it.action in ("ask", "chat"):
         txt = f"🤖 {esc(it.reply or 'Samajh nahi aaya, thoda aur batao.')}"
-        # same reply within short window => skip
         if LAST_REPLY.get(chat) == txt and not _cooldown_ok(chat, "chat", 25):
             return True
         if not _cooldown_ok(chat, "chat", 6):
@@ -2425,12 +2506,10 @@ async def misc_reply(message: Message, it: Intent) -> bool:
 
 async def download_message(client, message, text, urls):
     chat_id = message.chat.id
-    # 1) drop URLs already processed recently in this chat
     fresh = [u for u in urls if _dedup_url(chat_id, u)]
     if not fresh:
         logging.info(f"[dedup] all URLs already seen for chat {chat_id}, skipping")
         return
-    # 2) cap to a small batch to prevent flood
     fresh = fresh[:5]
 
     it = await get_intent(URL_REGEX.sub(" ", text).strip(), True, "")
@@ -2616,7 +2695,6 @@ async def janitor():
             p = os.path.join(DOWNLOAD_DIR, d)
             if os.path.isdir(p) and now - os.path.getmtime(p) > 4 * 3600:
                 shutil.rmtree(p, ignore_errors=True)
-        # purge anti-spam maps
         for cid in list(URL_DEDUP):
             URL_DEDUP[cid] = {u: t for u, t in URL_DEDUP[cid].items() if now - t < 300}
             if not URL_DEDUP[cid]:
