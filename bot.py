@@ -18,8 +18,6 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from urllib.parse import urlparse, urljoin, unquote
 
-# Seal ki tarah yt-dlp ko NIGHTLY channel pe rakhte hain (Seal ka default). Sites roz badalti hain aur
-# extractor fixes pehle nightly mein aate hain. Stable chahiye to YTDLP_CHANNEL=stable set karo.
 YTDLP_CHANNEL = os.environ.get("YTDLP_CHANNEL", "nightly").strip().lower()
 
 if os.environ.get("AUTO_UPDATE", "1") == "1":
@@ -63,10 +61,7 @@ COMPRESS_TARGET = int(os.environ.get("COMPRESS_TARGET_MB", 1900)) * MiB
 MAX_HEIGHT = 4320
 FALLBACK_HEIGHT = 720
 TIERS = (MAX_HEIGHT, FALLBACK_HEIGHT)
-# Seal ke default jaisa: 8 fragments parallel (HLS/DASH tez download)
 SEAL_FRAGMENTS = max(1, int(os.environ.get("CONCURRENT_FRAGMENTS", 8) or 8))
-# Jin sites ka yt-dlp mein apna extractor hai wahan browser-sniff (jo preview/junk clip utha leta hai) band hai.
-# Purana behaviour wapas chahiye to BROWSER_FALLBACK_KNOWN=1 set karo.
 BROWSER_FALLBACK_KNOWN = os.environ.get("BROWSER_FALLBACK_KNOWN", "0") == "1"
 COOKIES_FILE = "cookies.txt"
 ALLOWED = {int(x) for x in re.findall(r"\d+", os.environ.get("ALLOWED_IDS", ""))}
@@ -214,8 +209,6 @@ def get_site_config(url: str) -> dict:
 
 
 def browser_fallback_ok(url: str) -> bool:
-    """yt-dlp ka apna extractor wali site par browser-sniff tabhi chale jab BROWSER_FALLBACK_KNOWN=1 ho,
-    ya site ke liye SITE_SELECTORS mein khaas selectors likhe hon (jaise rule34video.com) — unka purana behaviour same rahe."""
     if BROWSER_FALLBACK_KNOWN:
         return True
     domain = urlparse(url).netloc.lower().replace("www.", "")
@@ -408,7 +401,6 @@ BLOCK_HINTS = ("403", "forbidden", "cloudflare", "429", "captcha", "challenge", 
 
 YTDLP_VER = getattr(getattr(yt_dlp, "version", None), "__version__", "?")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-# Ye errors pakke hain (video hi nahi hai) — baaki impersonation/cookie tries bekaar honge
 FATAL_HINTS = ("video unavailable", "has been removed", "been deleted", "does not exist", "no longer available",
                "video has been", "private video", "http error 404", "is private")
 
@@ -419,7 +411,6 @@ def clean_err(e) -> str:
 
 @lru_cache(maxsize=1024)
 def dedicated_extractor(url: str) -> str:
-    """yt-dlp ka apna (non-generic) extractor is URL ke liye ho to uska naam, warna ''."""
     try:
         from yt_dlp.extractor import gen_extractor_classes
         for ie in gen_extractor_classes():
@@ -466,7 +457,7 @@ class Source:
     thumbs: list = field(default_factory=list)
     use_url_name: bool = False
     imp: str = "chrome"
-    fmt_map: dict = field(default_factory=dict)   # {height: (video_format_id, audio_format_id|None)}  (Seal FormatPage jaisa)
+    fmt_map: dict = field(default_factory=dict)
     extractor: str = ""
 
 
@@ -915,8 +906,6 @@ def ydl_call(opts, fn, url=None):
 
 
 def ytdlp_extract(url, headers=None):
-    """Seal ka fetchVideoInfoFromUrl: yt-dlp se pura info/format list (download nahi).
-    Impersonation ladder (chrome -> safari -> koi nahi) har ek try hoti hai; aakhir mein asli yt-dlp error raise hota hai."""
     last = None
     ladder = [n for n in IMP_LADDER if not n or (not NO_IMP and impersonate_target(n))] or [""]
     for name in ladder:
@@ -945,11 +934,6 @@ def compact_formats(info):
     return [{k: f.get(k) for k in keys} for f in (info.get("formats") or [])]
 
 
-# --- Format samajh: yt-dlp ki apni definition ---------------------------------------------------
-# vcodec == "none"  -> audio-only.   vcodec None/unknown -> video maana jaata hai (yt-dlp ka `bv*` bhi aise hi karta hai).
-# acodec == "none"  -> video-only (audio alag se judega).   acodec None/unknown -> muxed (audio saath mein) maana jaata hai.
-# Pornhub jaisi sites ke direct mp4 formats mein vcodec/acodec khaali hota hai — purana code unhe "video nahi" maan kar
-# list se hata deta tha, isliye sirf ek 360p dikhta tha.
 def _is_vid(f) -> bool:
     return f.get("vcodec") != "none" and (f.get("height") or 0) > 0 and f.get("ext") != "mhtml"
 
@@ -967,7 +951,6 @@ def _fsize(f, duration) -> int:
 
 
 def _vkey(f):
-    """Ek hi height ke formats mein kaun sa best: h264 > direct(https) > mp4 > zyada bitrate (Seal compat sorter jaisa)."""
     vc = (f.get("vcodec") or "").lower()
     return (1 if vc.startswith(("avc", "h264")) else 0,
             1 if (f.get("protocol") or "") in ("https", "http") else 0,
@@ -1009,7 +992,6 @@ def build_quals(formats, duration):
 
 
 def build_fmt_map(formats, quals=None):
-    """Har quality (height) ke liye exact format id — Seal ke FormatPage jaisa `-f <video_id>+<audio_id>`."""
     aud = best_audio(formats)
     fmap = {}
     for h, _ in (quals if quals is not None else build_quals(formats, 0)):
@@ -1508,9 +1490,6 @@ async def resolve_source(url, status):
         await status("🔗 Direct link mila, check kar raha hoon…")
         return await source_from_media(url, origin_of(url) + "/", cookies, url_name=True)
 
-    # Seal ki tarah yt-dlp hi asli engine hai. Jin sites ka yt-dlp mein apna extractor hai (Pornhub, XVideos, YouTube…)
-    # wahan browser se "andaza" lagana galat clip (preview/trailer/age-gate page ka promo) utha leta tha — isliye wahan
-    # yt-dlp fail ho to browser par girne ki jagah asli error dikhate hain.
     known = await run(dedicated_extractor, url)
     generic = None
     err = ""
@@ -1618,10 +1597,6 @@ SAFE_FID = re.compile(r"^[A-Za-z0-9_.\-]+$")
 
 
 def seal_format_plans(pick, max_h, audio=False):
-    """Seal ka download tareeka, plan-by-plan:
-       1) exact `-f <video_id>+<audio_id>`  (jo quality button par dikhi wahi stream — Seal FormatPage)
-       2) `-S` sorter + `bv*+ba/b`          (Seal ka default: best quality, h264 ko tarjeeh)
-       3) plain best                        (aakhri bachav)"""
     if audio:
         return [("ba/b", None), ("b", None)]
     sort = [f"res:{max_h}", "vcodec:h264", "proto", "acodec:aac", "ext:mp4:m4a"]
@@ -1645,8 +1620,8 @@ def ytdlp_download(url, workdir, headers, max_h, prog, audio=False, imp="chrome"
         opts = base_ydl_opts(headers, False, name)
         opts.update({
             "outtmpl": os.path.join(workdir, "dl.%(ext)s"), "format": fmt,
-            "concurrent_fragment_downloads": SEAL_FRAGMENTS,   # --concurrent-fragments (Seal default 8)
-            "updatetime": False,                                # --no-mtime
+            "concurrent_fragment_downloads": SEAL_FRAGMENTS,
+            "updatetime": False,
             "progress_hooks": [hook], "noprogress": True,
         })
         if not audio:
@@ -1777,7 +1752,6 @@ def choose_tier(src: Source, q: int = 0) -> int:
 
 
 def pick_format(src: Source, tier: int):
-    """Chuni hui quality (tier) ke liye exact (video_id, audio_id). Tier se bada nahi, warna sabse chhota available."""
     if not src.fmt_map:
         return None
     ok = [h for h in src.fmt_map if h <= tier]
@@ -1818,50 +1792,55 @@ def _pixels(path):
 
 
 def fetch_thumbnail(job: Job):
+    """Pehle asli video stream se frame grab karta hai — yeh 100% usi video ka hoga.
+    Us se fail ho to yt-dlp ki preference list ka pehla valid thumbnail use karta hai."""
     if job.thumb_path and os.path.exists(job.thumb_path):
         return job.thumb_path
     s = job.src
+    hq = os.path.join(THUMB_DIR, f"{job.id}_hq.jpg")
+
+    # 1) Asli video stream se ek frame grab karo
+    video_url, vhdr = None, None
+    if s.mode == "ytdlp":
+        try:
+            opts = base_ydl_opts(dict(s.headers or {}), True, s.imp)
+            opts.update({"skip_download": True, "format": "worst[height<=480]/worst"})
+            info = ydl_call(opts, lambda y: y.extract_info(s.page_url, download=False), s.page_url)
+            if info and info.get("url"):
+                video_url = info["url"]
+                vhdr = info.get("http_headers") or s.headers or {}
+        except Exception as e:
+            logging.info(f"[thumb] ytdlp video url fail: {e}")
+    else:
+        video_url = s.dl_url
+        vhdr = dict(s.headers or {})
+
+    if video_url:
+        try:
+            at = max(1.0, (s.duration or 30) * 0.15)
+            if grab_frame(video_url, hq, at=at, headers=vhdr or None) and os.path.getsize(hq) > 3000:
+                job.thumb_path = hq
+                return hq
+        except Exception as e:
+            logging.info(f"[thumb] frame grab fail: {e}")
+
+    # 2) Fallback: yt-dlp ki preference list se pehli valid image (pixel-size se nahi chunte)
     sess = make_session(make_headers(s.page_url), s.cookies)
-    best, bpx = None, -1
     for i, u in enumerate(s.thumbs[:8]):
         try:
             r = sess.get(u, timeout=20, headers={"Accept": "image/*,*/*"})
             ct = (r.headers.get("content-type") or "").lower()
             if r.status_code != 200 or not ct.startswith("image/") or len(r.content) < 6 * 1024:
                 continue
-            ext = ".png" if "png" in ct else ".webp" if "webp" in ct else ".jpg" if ("jpeg" in ct or "jpg" in ct) else ".img"
-            raw = os.path.join(THUMB_DIR, f"{job.id}_c{i}{ext}")
-            with open(raw, "wb") as f:
+            ext = ".png" if "png" in ct else ".webp" if "webp" in ct else ".jpg"
+            out = os.path.join(THUMB_DIR, f"{job.id}_c{i}{ext}")
+            with open(out, "wb") as f:
                 f.write(r.content)
-            if ext == ".img":
-                out = os.path.join(THUMB_DIR, f"{job.id}_c{i}.jpg")
-                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", raw, "-q:v", "2", out],
-                               capture_output=True, timeout=60)
-                _rm(raw)
-                if not os.path.exists(out):
-                    continue
-                raw = out
-            px = _pixels(raw)
-            if px > bpx:
-                if best:
-                    _rm(best)
-                best, bpx = raw, px
-            else:
-                _rm(raw)
+            job.thumb_path = out
+            return out
         except Exception:
             continue
-    hq = os.path.join(THUMB_DIR, f"{job.id}_hq.jpg")
-    if bpx < 900_000:
-        if not os.path.exists(hq):
-            try:
-                grab_frame(s.dl_url, hq, at=max(1, (s.duration or 30) * 0.1), headers=dict(s.headers))
-            except Exception:
-                pass
-        if os.path.exists(hq) and _pixels(hq) > bpx:
-            best = hq
-    if best:
-        job.thumb_path = best
-    return best
+    return None
 
 
 MODE_LABEL = {"exact": "🎯 Exact (frame-exact)", "fast": "⚡ Fast (keyframe)"}
@@ -2405,24 +2384,24 @@ MEDIA_METHOD = {"photo": "sendPhoto", "animation": "sendAnimation", "video": "se
 
 
 async def out_text(client, chat, rid, text):
+    """Sirf ek hi baar bhejta hai. Fail hone par duplicate nahi bhejta (bhejne ke baad response padhne
+    se pehle timeout ho jaye to dobara bhejna duplicate create karta tha)."""
     try:
         return await tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML",
                         reply_parameters=reply_params(rid), link_preview_options={"is_disabled": True})
     except Exception as e:
-        logging.warning(f"[botapi] text fail: {str(e)[:150]}")
-    return await safe(client.send_message, chat, unquote_html(text), reply_to_message_id=rid,
-                      disable_web_page_preview=True)
+        logging.error(f"[botapi] text fail: {str(e)[:200]}")
+        return None
 
 
 async def out_media(client, chat, rid, kind, fid, caption):
+    """Wahi single-attempt policy — duplicate message se bachne ke liye fallback nahi."""
     try:
-        return await tg(MEDIA_METHOD[kind], chat_id=chat, **{kind: fid}, caption=caption, parse_mode="HTML",
-                        reply_parameters=reply_params(rid))
+        return await tg(MEDIA_METHOD[kind], chat_id=chat, **{kind: fid}, caption=caption,
+                        parse_mode="HTML", reply_parameters=reply_params(rid))
     except Exception as e:
-        logging.warning(f"[botapi] {kind} fail: {str(e)[:150]}")
-    sender = {"photo": client.send_photo, "animation": client.send_animation,
-              "video": client.send_video, "document": client.send_document}[kind]
-    return await safe(sender, chat, fid, caption=unquote_html(caption), reply_to_message_id=rid)
+        logging.error(f"[botapi] {kind} fail: {str(e)[:200]}")
+        return None
 
 
 async def safe(fn, *a, **k):
