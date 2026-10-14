@@ -81,6 +81,13 @@ UA = (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# ⚠️ FIX: START_TS ab module load pe hi set ho raha hai. Pehle ye main() ke andar set hota tha
+# aur app.start() usse pehle purane pending Telegram updates fetch karke process kar deta tha —
+# is wajah se GitHub Actions ke har restart pe purane messages naye random template ke saath
+# dubara bhej diye jaate the (999 template wala symptom).
+START_TS = time.time()
+STALE_SEC = int(os.environ.get("STALE_SEC", 25))
+
 try:
     app = Client(
         "video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
@@ -114,8 +121,6 @@ FAILS = {}
 PREFS = {}
 ALBUMS = {}
 SEEN = {}
-START_TS = 0.0
-STALE_SEC = int(os.environ.get("STALE_SEC", 25))
 MAX_POST_LINKS = 60
 BG_TASKS = set()
 URL_REGEX = re.compile(r'https?://[^\s<>"\']+')
@@ -478,6 +483,7 @@ class Job:
     thumb_sent: bool = False
     reply_to: int = None
     q: int = 0
+    video_msg_id: int = None  # ✅ Video delivery ke baad us video message ki id (cut button reply target)
 
 
 @dataclass
@@ -1792,14 +1798,11 @@ def _pixels(path):
 
 
 def fetch_thumbnail(job: Job):
-    """Pehle asli video stream se frame grab karta hai — yeh 100% usi video ka hoga.
-    Us se fail ho to yt-dlp ki preference list ka pehla valid thumbnail use karta hai."""
     if job.thumb_path and os.path.exists(job.thumb_path):
         return job.thumb_path
     s = job.src
     hq = os.path.join(THUMB_DIR, f"{job.id}_hq.jpg")
 
-    # 1) Asli video stream se ek frame grab karo
     video_url, vhdr = None, None
     if s.mode == "ytdlp":
         try:
@@ -1824,7 +1827,6 @@ def fetch_thumbnail(job: Job):
         except Exception as e:
             logging.info(f"[thumb] frame grab fail: {e}")
 
-    # 2) Fallback: yt-dlp ki preference list se pehli valid image (pixel-size se nahi chunte)
     sess = make_session(make_headers(s.page_url), s.cookies)
     for i, u in enumerate(s.thumbs[:8]):
         try:
@@ -1844,8 +1846,6 @@ def fetch_thumbnail(job: Job):
 
 
 MODE_LABEL = {"exact": "🎯 Exact (frame-exact)", "fast": "⚡ Fast (keyframe)"}
-
-
 QUALITY_TAG = {2160: " 4K", 1440: " 2K", 1080: " FHD", 720: " HD"}
 
 
@@ -1915,9 +1915,12 @@ def panel_kb(job: Job) -> InlineKeyboardMarkup:
     ])
 
 
-def thumb_kb(job: Job, seconds) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(
-        f"🖼 Thumbnail  •  ⏱ {fmt_dur(seconds)}", callback_data=f"th:{job.id}")]])
+def sent_video_kb(job: Job, seconds, include_cut=True) -> InlineKeyboardMarkup:
+    """Video delivery ke baad wala keyboard — thumbnail + optional cut button."""
+    rows = [[InlineKeyboardButton(f"🖼 Thumbnail  •  ⏱ {fmt_dur(seconds)}", callback_data=f"th:{job.id}")]]
+    if include_cut and job.src.duration and job.src.duration > 20:
+        rows.append([InlineKeyboardButton("✂️ Cut this video", callback_data=f"cutmsg:{job.id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def stage_a(job: Job, cut, workdir, prog: Progress, audio=False):
@@ -1976,18 +1979,21 @@ async def valid_reply(client, chat_id, mid):
         return mid
 
 
-async def send_one(client, chat_id, path, fname, caption, info, kb, prog, label, workdir, reply=None):
+async def send_one(client, chat_id, path, fname, caption, info, kb, prog, label, workdir, reply=None, job=None):
     thumb = os.path.join(workdir, f"{label}_thumb.jpg")
     loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(
         None, lambda: grab_frame(path, thumb, at=max(1, (info.get("duration") or 10) * 0.1), width=320, quality=5))
-    await client.send_video(
+    sent = await client.send_video(
         chat_id=chat_id, video=path, caption=caption, file_name=fname, supports_streaming=True,
         duration=int(info.get("duration") or 0), width=int(info.get("width") or 0),
         height=int(info.get("height") or 0), thumb=thumb if ok else None, reply_markup=kb,
         reply_to_message_id=reply,
         progress=_up_progress, progress_args=(prog, f"📤 Uploading ({label})"),
     )
+    if sent and job is not None and label == "full":
+        job.video_msg_id = sent.id
+    return sent
 
 
 async def _up_progress(current, total, prog, label):
@@ -2033,9 +2039,11 @@ async def run_delivery(client, job: Job, cut, audio=False):
                     if c["method"] != "none":
                         extra += "\n🗜 2GB limit ke liye compress hui"
                     fname = f"{base}_cut_{fmt_hms(c['start']).replace(':', '-')}_{fmt_hms(c['end']).replace(':', '-')}.mp4"
+                    # Cut video ke saath alag keyboard (cut button nahi, dobara cut nahi karna)
+                    kb = sent_video_kb(job, cdur, include_cut=False)
                     await send_one(client, job.chat_id, c["path"], fname,
                                    make_caption(base, c["info"], csize, extra), c["info"],
-                                   thumb_kb(job, cdur), prog, "cut", workdir, reply)
+                                   kb, prog, "cut", workdir, reply, job)
                 else:
                     full = res["full"]
                     method = "none"
@@ -2048,9 +2056,12 @@ async def run_delivery(client, job: Job, cut, audio=False):
                         extra = "\n🗜 2GB limit: sirf beech ka hissa compress hua (shuru/end original quality)"
                     elif method == "full":
                         extra = "\n🗜 2GB limit ke liye compress hui"
+                    # ✅ Full video par "Cut this video" button
+                    fdur = finfo.get("duration") or res["dur"]
+                    kb = sent_video_kb(job, fdur, include_cut=True)
                     await send_one(client, job.chat_id, full, f"{base}.mp4",
                                    make_caption(base, finfo, os.path.getsize(full), extra), finfo,
-                                   thumb_kb(job, finfo.get("duration") or res["dur"]), prog, "full", workdir, reply)
+                                   kb, prog, "full", workdir, reply, job)
                 try:
                     await msg.delete()
                 except Exception:
@@ -2088,6 +2099,7 @@ HELP_TEXT = (
     "<b>Video download</b>\n"
     "• Link bhejo, quality ka button dabao (size upar likha hota hai)\n"
     "• <b>✂️ Cut</b> keypad se, ya <code>link 1:20-2:45</code>\n"
+    "• Video milne ke baad usi message pe <b>✂️ Cut this video</b> button bhi milta hai\n"
     "• <b>🎵 Audio</b> = sirf audio, 🖼 Thumbnail = HD image\n\n"
     "<b>Post maker</b>\n"
     "• Image/video/GIF ke saath diskwala/terabox + Telegram link bhejo ya forward karo\n"
@@ -2107,9 +2119,16 @@ def status_text():
 
 
 async def _allowed(_, __, update):
+    # ⚠️ FIX: START_TS module level pe set hota hai, isliye app.start() ke dauraan aane wale
+    # purane buffered messages bhi reject ho jaate hain — duplicate/999-template issue khatam.
     d = getattr(update, "date", None)
-    if START_TS and isinstance(d, datetime) and d.timestamp() < START_TS - STALE_SEC:
-        return False
+    if isinstance(d, datetime):
+        try:
+            if d.timestamp() < START_TS - STALE_SEC:
+                logging.info(f"[allowed] stale message skip (age={int(time.time()-d.timestamp())}s)")
+                return False
+        except Exception:
+            pass
     u = getattr(update, "from_user", None)
     return not ALLOWED or bool(u and u.id in ALLOWED)
 
@@ -2384,8 +2403,7 @@ MEDIA_METHOD = {"photo": "sendPhoto", "animation": "sendAnimation", "video": "se
 
 
 async def out_text(client, chat, rid, text):
-    """Sirf ek hi baar bhejta hai. Fail hone par duplicate nahi bhejta (bhejne ke baad response padhne
-    se pehle timeout ho jaye to dobara bhejna duplicate create karta tha)."""
+    """Sirf ek hi baar bhejta hai. Fail hone par duplicate nahi bhejta."""
     try:
         return await tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML",
                         reply_parameters=reply_params(rid), link_preview_options={"is_disabled": True})
@@ -2395,7 +2413,6 @@ async def out_text(client, chat, rid, text):
 
 
 async def out_media(client, chat, rid, kind, fid, caption):
-    """Wahi single-attempt policy — duplicate message se bachne ke liye fallback nahi."""
     try:
         return await tg(MEDIA_METHOD[kind], chat_id=chat, **{kind: fid}, caption=caption,
                         parse_mode="HTML", reply_parameters=reply_params(rid))
@@ -2532,6 +2549,7 @@ async def album_post(client, message):
 
 
 async def template_reply(message, arg):
+    """Sirf EK sample message bhejta hai (pehle bhi ek hi tha, but ab explicit single-send guard)."""
     chat = message.chat.id
     if arg.isdigit() and arg != "0":
         n = int(arg)
@@ -2545,7 +2563,9 @@ async def template_reply(message, arg):
     else:
         head = (f"🎨 <b>{N_TPL} templates</b> hain. <code>template 5</code> likho fix karne ke liye, "
                 f"<code>template random</code> se wapas random. Sample:\n\n")
-    sample = "\n".join(pack(tpl(PREFS.get(chat) or random.randint(1, N_TPL)), [SAMPLE_VIDEO], [SAMPLE_TG], 4096))
+    chosen = PREFS.get(chat) or random.randint(1, N_TPL)
+    sample = "\n".join(pack(tpl(chosen), [SAMPLE_VIDEO], [SAMPLE_TG], 4096))
+    # Ek hi message — chunks ko join karke bheja jaa raha hai
     await out_text(message._client, chat, message.id, head + sample)
 
 
@@ -2612,11 +2632,14 @@ async def queue_cmd(_, message: Message):
 
 @app.on_message(filters.private & allowed & ~filters.command(["start", "help", "queue"]))
 async def router(client, message: Message):
+    # Message-level dedup (same chat + message id). SEEN 15 min tak rakhta hai; restart par list khaali
+    # ho jaati hai lekin _allowed filter purane messages reject kar deta hai (START_TS module level).
     now = time.time()
     for k in [k for k, v in SEEN.items() if now - v > 900]:
         SEEN.pop(k, None)
     key = (message.chat.id, message.id)
     if key in SEEN:
+        logging.info(f"[router] dup skip chat={message.chat.id} msg={message.id}")
         return
     SEEN[key] = now
     try:
@@ -2647,6 +2670,7 @@ async def router(client, message: Message):
 async def on_callback(client, cq: CallbackQuery):
     parts = (cq.data or "").split(":")
     act = parts[0]
+
     if act in ("tc", "gm"):
         f = FAILS.get(parts[1]) if len(parts) > 1 else None
         if not f:
@@ -2655,10 +2679,29 @@ async def on_callback(client, cq: CallbackQuery):
             return await cq.answer("⚠️ Gemini key set nahi hai (GEMINI_API_KEY)", show_alert=True)
         await cq.answer("⏳ Check kar raha hoon…")
         return spawn(retry_failed(client, cq.message, f, act, parts[2] if len(parts) > 2 else ""))
+
     job = JOBS.get(parts[1]) if len(parts) > 1 else None
     if not job:
         return await cq.answer("⌛ Ye request purani ho gayi — link dobara bhejo.", show_alert=True)
     chat = cq.message.chat.id
+
+    # ✅ Video message ke "✂️ Cut this video" button ka handler
+    # Ye panel ko usi video message ka reply bana kar bhejta hai, aur cut video bhi usi video message
+    # ka reply banke jaati hai (nai video message ki jagah).
+    if act == "cutmsg":
+        if job.busy:
+            return await cq.answer("⏳ Ye already process ho raha hai", show_alert=True)
+        await cq.answer("✂️ Cut panel khol raha hoon…")
+        job.cs, job.ce, job.sel, job.fresh = 0.0, job.src.duration or 600.0, "s", True
+        # Cut video yahan reply hogi — yani us video message pe jispe button tha
+        job.reply_to = cq.message.id
+        try:
+            panel = await cq.message.reply_text(panel_text(job), reply_markup=panel_kb(job), quote=True)
+        except Exception as e:
+            logging.error(f"[cutmsg] panel fail: {e}")
+            return
+        job.msg = panel
+        return
 
     if act == "th":
         if job.thumb_sent:
@@ -2750,16 +2793,17 @@ async def janitor():
 
 
 async def main():
-    global ANALYZE_SEM, DL_SEM, START_TS
+    global ANALYZE_SEM, DL_SEM
     ANALYZE_SEM = asyncio.Semaphore(MAX_CONCURRENT)
     DL_SEM = asyncio.Semaphore(MAX_CONCURRENT)
     for d in os.listdir(DOWNLOAD_DIR):
         shutil.rmtree(os.path.join(DOWNLOAD_DIR, d), ignore_errors=True)
     if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
         logging.error("❌ ffmpeg/ffprobe install nahi hai! (apt install ffmpeg)")
-    START_TS = time.time()
+    # ⚠️ NOTE: START_TS ab module level pe set hota hai (import pe), main() mein nahi.
     logging.info(f"yt-dlp {YTDLP_VER} (channel={YTDLP_CHANNEL}) | curl_cffi impersonation: "
-                 f"{'yes' if impersonate_target('chrome') else 'NO (pip install curl-cffi)'}")
+                 f"{'yes' if impersonate_target('chrome') else 'NO (pip install curl-cffi)'} | "
+                 f"START_TS={START_TS:.0f} (stale_sec={STALE_SEC})")
     await app.start()
     logging.info("🚀 Bot started")
     spawn(janitor())
