@@ -379,8 +379,8 @@ async def send_chunks(client, message: Message, kind: str, fid: str, chunks: lis
 async def post_message(client, message: Message, urls: list, kind: str, fid: str):
     """Jitne message user bhejega, exact utne hi template post banenge (1-to-1)."""
     vids, tgs = split_links(urls)
-    if not vids:
-        m = await safe(message.reply_text, "🎬 Video link nahi mila, sirf Telegram link hai.", quote=True)
+    if not vids and not tgs:
+        m = await safe(message.reply_text, "🔗 Is message mein koi link nahi mila.", quote=True)
         if getattr(m, "id", None):
             remember_sent(message.chat.id, m.id)
         return
@@ -405,13 +405,14 @@ async def album_post(client, message: Message):
             if u not in urls:
                 urls.append(u)
     vids, tgs = split_links(urls)
-    if not vids:
-        m = await safe(anchor.reply_text, "🔗 Is album mein video link nahi mila.", quote=True)
+    if not vids and not tgs:
+        m = await safe(anchor.reply_text, "🔗 Is album mein koi link nahi mila.", quote=True)
         if getattr(m, "id", None):
             remember_sent(chat, m.id)
         return
     chunks = pack(pick_tpl(chat), vids, tgs, 1024)
-    cls = {"photo": InputMediaPhoto, "video": InputMediaVideo, "document": InputMediaDocument}
+    cls = {"photo": InputMediaPhoto, "video": InputMediaVideo,
+           "document": InputMediaDocument, "animation": InputMediaDocument}
     metas = [(k, f) for k, f in (media_of(m) for m in group) if k in cls]
     if not metas:
         return await send_chunks(client, anchor, None, None, chunks)
