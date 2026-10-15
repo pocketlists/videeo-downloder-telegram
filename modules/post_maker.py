@@ -41,34 +41,49 @@ STYLES = [
     (0x1D63C, 0x1D656, 0x1D7EC),
 ]
 FRAMES = [
-    ("🦢✨", "✨🦢"), ("🍑", "🍑"), ("🔞", "🔞"), ("😈", "😈"), ("💦", "💦"),
-    ("🥵", "🥵"), ("👅", "👅"), ("💋", "💋"), ("🍒", "🍒"), ("🍓", "🍓"),
-    ("🌶️", "🌶️"), ("🫦", "🫦"), ("🍆", "🍆"), ("🔥🍑", "🍑🔥"), ("😈🔥", "🔥😈"),
-    ("💦🍑", "🍑💦"), ("🔞✨", "✨🔞"), ("🥵💦", "💦🥵"), ("💋🔥", "🔥💋"),
-    ("🍒🍑", "🍑🍒"), ("😈💦", "💦😈"), ("🫦💋", "💋🫦"), ("🌶️🔥", "🔥🌶️"), ("🍑🍆", "🍆🍑"),
+    ("🍑💦", "💦🍑"), ("🍆🔥", "🔥🍆"), ("🔞😈", "😈🔞"), ("🥵💦", "💦🥵"), ("👅🫦", "🫦👅"),
+    ("💋🍑", "🍑💋"), ("🍒🍆", "🍆🍒"), ("🌶️💦", "💦🌶️"), ("😈🍆", "🍆😈"), ("🍑🍆", "🍆🍑"),
+    ("💦🔥", "🔥💦"), ("🥵🍑", "🍑🥵"), ("🫦💦", "💦🫦"), ("🍆💦", "💦🍆"), ("🔥🍑", "🍑🔥"),
+    ("🔞🍆", "🍆🔞"), ("😈💦", "💦😈"), ("💋🍆", "🍆💋"), ("🥵🍆", "🍆🥵"), ("🍑🫦", "🫦🍑"),
+    ("💦👅", "👅💦"), ("🔥😈", "😈🔥"), ("🍆🥵", "🥵🍆"), ("🍒💦", "💦🍒"), ("🔞🍑", "🍑🔞"),
+    ("🍆🍑", "🍑🍆"), ("💦🍆", "🍆💦"), ("🥵🫦", "🫦🥵"), ("😈🍑", "🍑😈"), ("🔥👅", "👅🔥"),
+    ("🍑🔥💦", "💦🔥🍑"), ("🍆💦🔥", "🔥💦🍆"), ("🫦🍆", "🍆🫦"), ("👅🍑", "🍑👅"), ("💋💦", "💦💋"),
+    ("🍆🫦", "🫦🍆"), ("🍑👅", "👅🍑"), ("💦🥵", "🥵💦"), ("🔥💋", "💋🔥"), ("😈🫦", "🫦😈"),
+    ("🍒🔥", "🔥🍒"), ("🌶️🍆", "🍆🌶️"), ("🔞💦", "💦🔞"), ("🥵👅", "👅🥵"), ("🍑💋💦", "💦💋🍑"),
 ]
 TITLES = [
-    "18+ EXCLUSIVE", "ADULT ANIMATION", "EXCLUSIVE ANIMATION", "AFTER DARK SPECIAL",
-    "SPICY UPLOAD", "HOT & STEAMY", "LATE NIGHT SPECIAL", "PRIVATE SHOW",
-    "VIP ADULT UPLOAD", "NAUGHTY NIGHT", "UNCENSORED RELEASE", "MIDNIGHT TREAT",
-    "FRESH & HOT DROP", "ADULTS ONLY", "SECRET SHOW", "HOT NEW EPISODE",
-    "STEAMY EPISODE", "EXCLUSIVE PREMIERE", "FULL VIDEO", "NEW UPLOAD",
-    "SPECIAL SHOW", "TODAY'S TREAT", "TRENDING NOW", "FRESH EPISODE",
-    "FORBIDDEN FRUIT", "SWEET & SPICY", "LATE NIGHT DROP", "VIP EXCLUSIVE",
-    "ONLY HERE", "FULL HD UPLOAD",
+    "18+ EXCLUSIVE", "ADULT ANIMATION", "HARDCORE DROP", "AFTER DARK FUCK",
+    "SPICY UPLOAD", "HOT & WET", "LATE NIGHT FUCK", "PRIVATE HOLE",
+    "VIP ADULT UPLOAD", "NAUGHTY NIGHT", "UNCENSORED FUCK", "MIDNIGHT CUM",
+    "FRESH & WET DROP", "ADULTS ONLY", "SECRET HOLE", "HOT NEW EPISODE",
+    "STEAMY FUCK", "EXCLUSIVE PREMIERE", "FULL HARD VIDEO", "NEW CUM DROP",
+    "SPECIAL FUCK SHOW", "TODAY'S HOLE", "TRENDING FUCK", "FRESH EPISODE",
+    "FORBIDDEN HOLE", "SWEET & SPICY", "LATE NIGHT CUM", "VIP EXCLUSIVE",
+    "ONLY HERE", "FULL HD FUCK", "RAW & DIRTY", "DEEP INSIDE",
+    "CUM LOADED", "HARDCORE ONLY", "WET & READY", "DIRTY PREMIERE",
+    "FULL LOAD DROP", "PRIVATE FUCK", "18+ HARDCORE", "MIDNIGHT HOLE",
 ]
 SEPS = [
     "━" * 18, "─" * 16, "▬" * 12, "•┈┈┈┈•✦•┈┈┈┈•", "═" * 15, "✦━━━━━━━━━✦",
     "⋆⋅☆⋅⋆⋅☆⋅⋆⋅☆⋅⋆", "┄" * 14, "▰▱" * 8, "•" * 18, "◈━━━━━━━━━━◈", "⟡" * 10,
-    "━━━━ ✦ ━━━━", "〰️" * 8, "═══ ◆ ═══", "✧･ﾟ: *✧･ﾟ:* *:･ﾟ✧", "🍑" * 7,
-    "🔞 ━━━━━━━━━ 🔞", "💦" * 8, "😈 • • • • • 😈", "🔥━━━━━━━━━━🔥", "💋 ─ ─ ─ ─ ─ 💋",
+    "━━━━ ✦ ━━━━", "〰️" * 8, "═══ ◆ ═══", "✧･ﾟ: *✧･ﾟ:* *:･ﾟ✧",
+    "🍑" * 7, "🍆" * 7, "💦" * 8, "🔞 ━━━━━━━━━ 🔞",
+    "😈 • • • • • 😈", "🔥━━━━━━━━━━🔥", "💋 ─ ─ ─ ─ ─ 💋",
+    "🍑💦🍑💦🍑💦🍑", "🍆🔥🍆🔥🍆🔥🍆", "💦🔞💦🔞💦🔞💦",
+    "🫦━━━━━━━━━━🫦", "👅 • • • • • 👅", "🥵━━━━🥵━━━━🥵",
+    "🍑🍆🍑🍆🍑🍆🍑", "🔥💦🔥💦🔥💦🔥", "😈🍆😈🍆😈🍆😈",
 ]
 WATCH = [
-    ("🎬", "WATCH NOW", "👇🔥"), ("🍑", "WATCH HERE", "👇💦"),
-    ("🔞", "FULL VIDEO", "👇😈"), ("😈", "PLAY NOW", "👇🔥"),
-    ("💦", "WATCH FULL VIDEO", "👇"), ("🥵", "CLICK TO WATCH", "👇🔥"),
-    ("📺", "STREAM NOW", "👇💋"), ("🎥", "VIDEO LINK", "👇🍑"),
-    ("⬇️", "DOWNLOAD HERE", "👇💦"), ("🔥", "GET THE VIDEO", "👇😈"),
+    ("🍆", "WATCH FULL VIDEO", "👇💦"), ("🍑", "CLICK TO FUCK", "👇🔥"),
+    ("💦", "WATCH NOW", "👇🍆"), ("🥵", "PLAY THIS HOLE", "👇🍑"),
+    ("👅", "LICK & WATCH", "👇💦"), ("🫦", "FULL HARD VIDEO", "👇🔥"),
+    ("🔥", "RAW & UNCUT", "👇🍆"), ("😈", "DIRTY VIDEO", "👇💦"),
+    ("🔞", "ADULTS ONLY", "👇🍑"), ("🍆💦", "CUM WATCHING", "👇"),
+    ("🍑🍆", "FUCK THIS VIDEO", "👇💦"), ("🥵🍆", "HARDCORE NOW", "👇🔥"),
+    ("💦🍑", "WET & READY", "👇🍆"), ("🫦🔥", "DEEP INSIDE", "👇💦"),
+    ("👅🍆", "SUCK & WATCH", "👇🍑"), ("🔥💦", "CUM HARD", "👇🍆"),
+    ("😈🍑", "DIRTY HOLE", "👇💦"), ("💋🍆", "KISS THE TIP", "👇🔥"),
+    ("🥵🫦", "MOAN LOUD", "👇🍑"), ("🍆🔥💦", "FULL LOAD", "👇"),
 ]
 PASS = [
     ("🔐", "PASS LINK", "👇"), ("🗝️", "ACCESS LINK", "👇😈"),
@@ -78,13 +93,17 @@ PASS = [
     ("🎟️", "ENTRY PASS", "👇🔥"), ("📌", "IMPORTANT LINK", "👇"),
 ]
 FOOT = [
-    ("🍑", "ENJOY THE SHOW", "❤️‍🔥"), ("😈", "HAVE FUN TONIGHT", ""),
-    ("💦", "ENJOY & SHARE", ""), ("🔞", "ADULTS ONLY", ""),
-    ("🥵", "STAY TUNED FOR MORE", ""), ("💋", "THANKS FOR WATCHING", ""),
-    ("🔥", "ENJOY THE VIDEO", "🍑"), ("🤫", "KEEP IT PRIVATE", ""),
-    ("🍆", "SEE YOU NEXT TIME", "💦"), ("🫦", "LIKE & SHARE", "💋"),
+    ("🍑", "ENJOY THE HOLE", "💦"), ("😈", "FUCK HARD TONIGHT", ""),
+    ("💦", "CUM & SHARE", ""), ("🔞", "ADULTS ONLY", ""),
+    ("🥵", "STAY HORNY FOR MORE", ""), ("💋", "THANKS FOR WATCHING", "🍆"),
+    ("🔥", "ENJOY THE FUCK", "🍑"), ("🤫", "KEEP IT PRIVATE", ""),
+    ("🍆", "SEE YOU NEXT ROUND", "💦"), ("🫦", "LIKE & CUM", "💋"),
+    ("👅", "LICK & COME BACK", "🍆"), ("🍑💦", "STAY WET", "🔥"),
+    ("🍆🔥", "HARDER NEXT TIME", "💦"), ("🥵🍆", "MORE CUM SOON", ""),
+    ("😈💦", "DIRTY AGAIN", "🍑"), ("💋🫦", "KISS & SHARE", ""),
+    ("🔥🍑", "KEEP FUCKING", "💦"), ("👅🍆", "SUCK MORE", "🔥"),
 ]
-BULLETS = ["🍑", "😈", "💦", "🔥", "💋", "🔞", "🥵", "🍒"]
+BULLETS = ["🍑", "🍆", "💦", "🔥", "💋", "🔞", "🥵", "🫦", "👅", "😈", "🍒", "🌶️", "🍌", "🥒", "🍯"]
 N_TPL = 999
 SAMPLE_VIDEO = "https://example.com/video-link"
 SAMPLE_TG = "https://t.me/+example"
