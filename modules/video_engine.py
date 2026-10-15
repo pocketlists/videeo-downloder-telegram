@@ -1766,8 +1766,9 @@ def fetch_thumbnail(job: Job):
         return job.thumb_path
     s = job.src
     sess = make_session(make_headers(s.page_url), s.cookies)
-    best, bpx = None, -1
-    for i, u in enumerate(s.thumbs[:8]):
+    best, bscore = None, -1.0
+    # 1) Site ke diye gaye thumbnails — resolution + brightness + detail se best chuno
+    for i, u in enumerate(s.thumbs[:10]):
         try:
             r = sess.get(u, timeout=20, headers={"Accept": "image/*,*/*"})
             ct = (r.headers.get("content-type") or "").lower()
@@ -1777,27 +1778,302 @@ def fetch_thumbnail(job: Job):
             raw = os.path.join(THUMB_DIR, f"{job.id}_c{i}{ext}")
             with open(raw, "wb") as f:
                 f.write(r.content)
-            px = _pixels(raw)
-            if px > bpx:
+            sc = _img_quality(raw)
+            if sc > bscore:
                 if best:
                     _rm(best)
-                best, bpx = raw, px
+                best, bscore = raw, sc
             else:
                 _rm(raw)
         except Exception:
             continue
-    hq = os.path.join(THUMB_DIR, f"{job.id}_hq.jpg")
-    if bpx < 900_000:
-        if not os.path.exists(hq):
+    # 2) Web thumb chhoti/blank ho to video ke kai frames se best frame nikalo
+    if bscore < 900_000.0:
+        dur = s.duration or 30
+        for k, frac in enumerate((0.08, 0.25, 0.5, 0.75)):
+            cand = os.path.join(THUMB_DIR, f"{job.id}_fr{k}.jpg")
             try:
-                grab_frame(s.dl_url, hq, at=max(1, (s.duration or 30) * 0.1), headers=dict(s.headers))
+                grab_frame(s.dl_url, cand, at=max(1.0, dur * frac), headers=dict(s.headers))
             except Exception:
-                pass
-        if os.path.exists(hq) and _pixels(hq) > bpx:
-            best = hq
+                continue
+            if not os.path.exists(cand):
+                continue
+            sc = _img_quality(cand)
+            if sc > bscore:
+                if best:
+                    _rm(best)
+                best, bscore = cand, sc
+            else:
+                _rm(cand)
     if best:
         job.thumb_path = best
     return best
+
+
+
+# ==========================================================================
+# CENSOR ENGINE  (100% local / offline — NudeNet + OpenCV + Pillow)
+# Kuch bhi cloud/AI par nahi jaata. Sirf jab user khud "Censor" dabaye tab chalta hai.
+# ==========================================================================
+CENSOR_MIN_SCORE = float(os.environ.get("CENSOR_MIN_SCORE", "0.35"))
+CENSOR_SCAN_SEC = float(os.environ.get("CENSOR_SCAN_SEC", "0.5"))
+CENSOR_PAD = float(os.environ.get("CENSOR_PAD", "0.12"))
+
+# Instagram-ish: sirf ye exposed labels chhupate hain (face/arms/belly/male-chest nahi).
+# Dono nudenet naming schemes support (naya "*_EXPOSED" aur purana "EXPOSED_*").
+CENSOR_LABELS = {
+    "BUTTOCKS_EXPOSED", "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED",
+    "ANUS_EXPOSED", "MALE_GENITALIA_EXPOSED",
+    "EXPOSED_ANUS", "EXPOSED_BUTTOCKS", "EXPOSED_BREAST_F",
+    "EXPOSED_GENITALIA_F", "EXPOSED_GENITALIA_M",
+}
+
+_detector = None
+_detector_lock = threading.Lock()
+
+
+def _nudenet():
+    global _detector
+    if _detector is not None:
+        return _detector
+    with _detector_lock:
+        if _detector is None:
+            from nudenet import NudeDetector
+            try:
+                _detector = NudeDetector()          # 320n (fast)
+            except Exception:
+                _detector = NudeDetector("640m")    # bigger fallback
+    return _detector
+
+
+def _detect_raw(src):
+    """Sensitive regions -> [{label, score, box:(x,y,w,h)}]  (empty agar kuch nahi mila).
+    `src` file path ya numpy frame dono chalega."""
+    try:
+        dets = _nudenet().detect(src)
+    except Exception as e:
+        logging.warning(f"[censor] detect fail: {str(e)[:120]}")
+        return []
+    out = []
+    for d in dets or []:
+        label = str(d.get("class") or d.get("label") or "").upper()
+        try:
+            score = float(d.get("score") or 0)
+        except Exception:
+            score = 0.0
+        box = d.get("box") or d.get("bbox")
+        if label in CENSOR_LABELS and score >= CENSOR_MIN_SCORE and box:
+            x, y, w, h = [int(v) for v in box[:4]]
+            if w > 2 and h > 2:
+                out.append({"label": label, "score": score, "box": (x, y, w, h)})
+    return out
+
+
+def _grow_box(box, W, H, pad=None):
+    pad = CENSOR_PAD if pad is None else pad
+    x, y, w, h = box
+    px, py = int(w * pad), int(h * pad)
+    x0, y0 = max(0, x - px), max(0, y - py)
+    x1, y1 = min(W, x + w + px), min(H, y + h + py)
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def _avg_color(img, box):
+    """Box ke aas-paas ka average colour (blend mode ke liye)."""
+    x, y, w, h = box
+    W, H = img.size
+    m = max(8, int(0.3 * max(w, h)))
+    sx0, sy0 = max(0, x - m), max(0, y - m)
+    sx1, sy1 = min(W, x + w + m), min(H, y + h + m)
+    strip = img.crop((sx0, sy0, sx1, sy1))
+    if strip.width < 1 or strip.height < 1:
+        return (40, 40, 40)
+    return strip.resize((1, 1)).getpixel((0, 0))
+
+
+def censor_image(src, dst, mode="blur"):
+    """Nudity detect karke image ke sensitive parts blur / blend karta hai."""
+    from PIL import Image, ImageFilter
+    img = Image.open(src).convert("RGB")
+    W, H = img.size
+    dets = _detect_raw(src)
+    for d in dets:
+        x, y, w, h = _grow_box(d["box"], W, H)
+        if mode == "blend":
+            patch = Image.new("RGB", (w, h), _avg_color(img, (x, y, w, h)))
+        else:
+            region = img.crop((x, y, x + w, y + h))
+            radius = max(8, int(min(w, h) * 0.35))
+            patch = region.filter(ImageFilter.GaussianBlur(radius))
+        img.paste(patch, (x, y))
+    img.save(dst, quality=92)
+    return {"path": dst, "found": len(dets), "labels": sorted({d["label"] for d in dets})}
+
+
+def censor_video(src, dst, prog=None, mode="blur"):
+    """Sampled frames par NudeNet, phir OpenCV blur/blend + ffmpeg H.264 mux (audio copy)."""
+    import cv2
+    info = ffprobe(src) or {}
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        raise RuntimeError("Censor: video open nahi hui")
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or info.get("width") or 0
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or info.get("height") or 0
+    fps = cap.get(cv2.CAP_PROP_FPS) or info.get("fps") or 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or int((info.get("duration") or 0) * fps)
+    if not W or not H:
+        cap.release()
+        raise RuntimeError("Censor: resolution nahi mili")
+    step = max(1, int(round(fps * CENSOR_SCAN_SEC)))
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", f"{fps}", "-i", "-",
+           "-i", src, "-map", "0:v:0", "-map", "1:a:0?",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+           "-c:a", "copy", "-movflags", "+faststart", dst]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    idx, found, boxes = 0, 0, []
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % step == 0:
+                dets = _detect_raw(frame)          # BGR frame seedha detector ko (no temp file)
+                boxes = [_grow_box(d["box"], W, H) for d in dets]
+                found += len(boxes)
+            for (x, y, w, h) in boxes:
+                roi = frame[y:y + h, x:x + w]
+                if roi.size == 0:
+                    continue
+                if mode == "blend":
+                    roi[:] = roi.reshape(-1, 3).mean(axis=0).astype("uint8")
+                else:
+                    k = max(9, (min(w, h) // 3) | 1)
+                    frame[y:y + h, x:x + w] = cv2.GaussianBlur(roi, (k, k), 0)
+            try:
+                p.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                break
+            idx += 1
+            if prog and total and idx % (step * 4) == 0:
+                prog.update("🔞 Censoring", idx, total, "time")
+    finally:
+        cap.release()
+        try:
+            p.stdin.close()
+        except Exception:
+            pass
+        p.wait()
+    if p.returncode != 0 or not os.path.exists(dst):
+        raise RuntimeError("Censor encode fail")
+    return {"path": dst, "found": found}
+
+
+def censor_any(path, prog=None, mode="blur"):
+    """File video hai ya image — apne aap decide karke censor karta hai."""
+    info = ffprobe(path) or {}
+    if info.get("vcodec"):
+        return censor_video(path, os.path.splitext(path)[0] + "_censored.mp4", prog, mode)
+    return censor_image(path, os.path.splitext(path)[0] + "_censored.jpg", mode)
+
+
+def post_kb(job: Job) -> InlineKeyboardMarkup:
+    """Har bheji gayi video ke saath — Cut / Censor / Thumbnail (sirf jab user khud dabaye)."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✂️ Cut", callback_data=f"pc:{job.id}"),
+        InlineKeyboardButton("🔞 Censor", callback_data=f"pz:{job.id}"),
+        InlineKeyboardButton("🖼 Thumbnail", callback_data=f"th:{job.id}"),
+    ]])
+
+
+async def run_censor(client, job: Job, mode="blur"):
+    global active_downloads
+    loop = asyncio.get_running_loop()
+    job.busy = True
+    msg = job.msg
+    prog = Progress(loop, msg, f"🔞 <b>Censor: {esc(job.src.title[:55])}</b>")
+    workdir = os.path.join(DOWNLOAD_DIR, f"cz_{job.id}_{int(time.time())}")
+    os.makedirs(workdir, exist_ok=True)
+    try:
+        async with DL_SEM:
+            active_downloads += 1
+            try:
+                await prog.stage("⬇️ Video laa raha hoon…")
+                path = await loop.run_in_executor(None, download_media, job.src, workdir, prog, job.q, False)
+                await prog.stage("🔞 Nudity detect + censor (offline)…")
+                r = await loop.run_in_executor(None, censor_any, path, prog, mode)
+                info = ffprobe(r["path"]) or {}
+                base = sanitize_filename(job.src.title or "video")
+                cap = (
+                    f"🔞 <b>Censored</b>\n\n🎬 <b>Name:</b> <code>{esc(base)}</code>\n"
+                    f"🩹 <b>Regions hidden:</b> <code>{r.get('found', 0)}</code>\n"
+                    f"📦 <b>Size:</b> <code>{humanbytes(os.path.getsize(r['path']))}</code>"
+                )
+                await send_one(
+                    client, job.chat_id, r["path"], f"{base}_censored.mp4",
+                    cap, info, post_kb(job), prog, "cz", workdir, job.reply_to
+                )
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            finally:
+                active_downloads -= 1
+    except Exception as e:
+        logging.exception("censor failed")
+        try:
+            await msg.edit_text(f"❌ <b>Censor fail:</b>\n<code>{esc(str(e)[:300])}</code>")
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        job.busy = False
+
+
+async def censor_photo_message(client, message: Message, mode="blur"):
+    """User ne image bheji + censor maanga -> download, censor, wapas bhejo."""
+    media = message.photo or message.document
+    if not media:
+        return
+    loop = asyncio.get_running_loop()
+    st = await message.reply_text("🔞 Image censor ho rahi hai…", quote=True)
+    if getattr(st, "id", None):
+        remember_sent(message.chat.id, st.id)
+    workdir = os.path.join(DOWNLOAD_DIR, f"ci_{int(time.time())}")
+    os.makedirs(workdir, exist_ok=True)
+    try:
+        path = await client.download_media(media, file_name=os.path.join(workdir, "in.jpg"))
+        r = await loop.run_in_executor(None, censor_image, path, os.path.join(workdir, "out.jpg"), mode)
+        cap = f"🔞 <b>Censored image</b>\n🩹 Regions hidden: <code>{r.get('found', 0)}</code>"
+        m = await client.send_photo(message.chat.id, r["path"], caption=cap, reply_to_message_id=message.id)
+        if getattr(m, "id", None):
+            remember_sent(message.chat.id, m.id)
+        try:
+            await st.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            await st.edit_text(f"❌ Censor fail: <code>{esc(str(e)[:200])}</code>")
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _img_quality(path):
+    """Thumbnail score: resolution x brightness x detail (kaali/blank frame neeche)."""
+    try:
+        from PIL import Image, ImageStat
+        with Image.open(path) as im:
+            g = im.convert("L")
+            px = g.width * g.height
+            st = ImageStat.Stat(g)
+            mean, var = st.mean[0], st.var[0]
+        bright = 1.0 if 30 <= mean <= 230 else 0.2
+        return px * bright * (1.0 + min(var, 4000) / 4000.0)
+    except Exception:
+        return float(_pixels(path))
 
 
 MODE_LABEL = {"exact": "🎯 Exact (frame-exact)", "fast": "⚡ Fast (keyframe)"}
@@ -2005,7 +2281,7 @@ async def run_delivery(client, job: Job, cut, audio=False, compress=None):
                 if cmpr and not cmpr["skipped"]:
                     await send_one(
                         client, job.chat_id, cmpr["path"], f"{base}_compressed.mp4",
-                        cmp_caption(base, cmpr), cmpr["info"], thumb_kb(job, cmpr["info"].get("duration")),
+                        cmp_caption(base, cmpr), cmpr["info"], post_kb(job),
                         prog, "cmp", workdir, reply
                     )
                 elif res.get("audio"):
@@ -2025,7 +2301,6 @@ async def run_delivery(client, job: Job, cut, audio=False, compress=None):
                 elif res["cut"]:
                     c = res["cut"]
                     csize = os.path.getsize(c["path"])
-                    cdur = c["info"].get("duration") or (c["end"] - c["start"])
                     extra = (
                         f"\n✂️ <b>Cut:</b> <code>{fmt_hms(c['start'])} → {fmt_hms(c['end'])}</code>"
                         f" ({'frame-exact' if c['mode'] == 'exact' else 'keyframe'})"
@@ -2034,7 +2309,7 @@ async def run_delivery(client, job: Job, cut, audio=False, compress=None):
                     await send_one(
                         client, job.chat_id, c["path"], fname,
                         make_caption(base, c["info"], csize, extra), c["info"],
-                        thumb_kb(job, cdur), prog, "cut", workdir, reply
+                        post_kb(job), prog, "cut", workdir, reply
                     )
                 else:
                     full = res["full"]
@@ -2051,7 +2326,7 @@ async def run_delivery(client, job: Job, cut, audio=False, compress=None):
                     await send_one(
                         client, job.chat_id, full, f"{base}{q_suffix}.mp4",
                         make_caption(base, finfo, os.path.getsize(full), extra), finfo,
-                        thumb_kb(job, finfo.get("duration") or res["dur"]), prog, "full", workdir, reply
+                        post_kb(job), prog, "full", workdir, reply
                     )
                 try:
                     await msg.delete()
@@ -2396,6 +2671,16 @@ async def handle_callback(client, cq: CallbackQuery):
             return await cq.answer("⚠️ Start/End time sahi daalo", show_alert=True)
         await cq.answer("✂️ Cut + Download shuru…")
         return spawn(run_delivery(client, job, (job.cs, min(job.ce, D) if D else job.ce, job.mode)))
+    if act == "pc":
+        await cq.answer("✂️ Cut panel khol raha hoon…")
+        job.cs, job.ce, job.sel, job.fresh = 0.0, job.src.duration or 600.0, "s", True
+        return await refresh()
+    if act == "pz":
+        await cq.answer("🔞 Censor (blur) shuru…")
+        return spawn(run_censor(client, job, "blur"))
+    if act == "pb":
+        await cq.answer("🎨 Censor (blend) shuru…")
+        return spawn(run_censor(client, job, "blend"))
     if act == "cut":
         job.cs, job.ce, job.sel, job.fresh = 0.0, job.src.duration or 600.0, "s", True
     elif act == "cs":
