@@ -3,6 +3,7 @@ name: Run Telegram Video Downloader Bot
 on:
   workflow_dispatch:
 
+# Ye purane chal rahe bot run ko turant cancel karta hai -> double/triple message nahi aayenge
 concurrency:
   group: telegram-bot-${{ github.ref }}
   cancel-in-progress: true
@@ -22,12 +23,12 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install System Dependencies (FFmpeg)
+      - name: Install System Dependencies (FFmpeg + OpenCV/ONNX libs)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg libglib2.0-0 libsm6 libxext6 libgomp1
 
-      - name: Install Python Packages (Seal Engine + Bot)
+      - name: Install Python Packages
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -37,6 +38,9 @@ jobs:
         run: |
           python -m playwright install chromium
           python -m playwright install-deps chromium
+
+      - name: Warm-up Censor Model (offline check)
+        run: python -c "from nudenet import NudeDetector; NudeDetector(); print('NudeNet model ready (bundled 320n.onnx)')"
 
       - name: Setup Cookies
         env:
@@ -55,4 +59,6 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          BATCH_WINDOW: '4'
+          ASK_MODE: 'auto'
         run: python bot.py
