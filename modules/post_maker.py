@@ -15,6 +15,8 @@ from pyrogram.errors import FloodWait
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MAX_POST_LINKS = 60
+MAX_SEPARATE_POSTS = int(os.environ.get("MAX_SEPARATE_POSTS", 25))
+POST_GAP = float(os.environ.get("POST_GAP", 0.8))
 
 # Anti-Loop & State Tracking
 PREFS = {}
@@ -250,6 +252,10 @@ def is_video_media(m: Message) -> bool:
     return bool(d and str(getattr(d, "mime_type", "") or "").startswith("video/"))
 
 
+def is_post_only_links(urls: list) -> bool:
+    return bool(urls) and all(is_tg(u) or is_filehost(u) for u in urls)
+
+
 def split_links(urls: list):
     return [u for u in urls if not is_tg(u)][:MAX_POST_LINKS], [u for u in urls if is_tg(u)][:6]
 
@@ -377,16 +383,20 @@ async def send_chunks(client, message: Message, kind: str, fid: str, chunks: lis
 
 
 async def post_message(client, message: Message, urls: list, kind: str, fid: str):
-    """Jitne message user bhejega, exact utne hi template post banenge (1-to-1)."""
     vids, tgs = split_links(urls)
     if not vids and not tgs:
         m = await safe(message.reply_text, "🔗 Is message mein koi link nahi mila.", quote=True)
         if getattr(m, "id", None):
             remember_sent(message.chat.id, m.id)
         return
-    t = pick_tpl(message.chat.id)
-    limit = 1024 if kind else 4096
-    await send_chunks(client, message, kind, fid, pack(t, vids, tgs, limit))
+    if kind or len(vids) <= 1:
+        t = pick_tpl(message.chat.id)
+        limit = 1024 if kind else 4096
+        return await send_chunks(client, message, kind, fid, pack(t, vids, tgs, limit))
+    for i, v in enumerate(vids[:MAX_SEPARATE_POSTS]):
+        if i:
+            await asyncio.sleep(POST_GAP)
+        await send_chunks(client, message, None, None, pack(pick_tpl(message.chat.id), [v], tgs, 4096))
 
 
 async def album_post(client, message: Message):
