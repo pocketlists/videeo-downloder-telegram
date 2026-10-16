@@ -26,14 +26,29 @@ from pyrogram.errors import FloodWait
 from playwright.async_api import async_playwright
 
 from modules.post_maker import remember_sent, template_reply, URL_REGEX
+from modules.censor_engine import (
+    censor_image, censor_video, censor_any, censor_backends, video_seconds,
+    CENSOR_MAX_SEC, CENSOR_STYLE,
+)
 
 try:
     import google.generativeai as genai
 except Exception:
     genai = None
 
+try:
+    from pyrogram import StopTransmission
+except Exception:
+    try:
+        from pyrogram.errors import StopTransmission
+    except Exception:
+        class StopTransmission(Exception):
+            pass
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip()
+PROXY_URL = os.environ.get("PROXY_URL", "")
+FALLBACK_PROXY = os.environ.get("FALLBACK_PROXY", "")
 
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 2))
 MiB = 1024 * 1024
@@ -44,7 +59,6 @@ FALLBACK_HEIGHT = 720
 TIERS = (MAX_HEIGHT, FALLBACK_HEIGHT)
 STANDARD_QUALITIES = (2160, 1440, 1080, 720, 480, 360)
 COOKIES_FILE = "cookies.txt"
-PROXY_URL = os.environ.get("PROXY_URL", "")
 FORCE_IPV4 = os.environ.get("FORCE_IPV4", "0") == "1"
 HEADLESS = os.environ.get("HEADLESS", "1") == "1"
 
@@ -58,14 +72,84 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+class Cancelled(Exception):
+    pass
+
+
+GEMINI_SKIP = ("lite", "image", "tts", "thinking", "exp", "live", "audio", "vision", "embedding", "learnlm", "gemma", "robotics", "computer")
+GEMINI_DEAD = ("404", "not found", "no longer available", "not supported", "deprecated", "no longer supported")
+
+
+def _ver_key(name):
+    return tuple(int(x) for x in re.findall(r"\d+", name)) or (0,)
+
+
+def gemini_candidates():
+    names = []
+    if GEMINI_MODEL:
+        names.append(GEMINI_MODEL)
+    names.append("gemini-flash-latest")
+    found = []
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(lambda: [
+                m.name.split("/")[-1] for m in genai.list_models()
+                if "generateContent" in (getattr(m, "supported_generation_methods", None) or [])
+            ])
+            found = fut.result(timeout=20)
+    except Exception as e:
+        logging.warning(f"[ai] list_models fail: {str(e)[:120]}")
+    flash = [n for n in found if "flash" in n and not any(k in n for k in GEMINI_SKIP)]
+    flash.sort(key=_ver_key, reverse=True)
+    names += flash
+    names += ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    out = []
+    for n in names:
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+class _AI:
+    def __init__(self, names):
+        self.names = names
+        self.i = 0
+        self.cache = {}
+
+    def generate_content(self, prompt, **kw):
+        last = None
+        for _ in range(len(self.names)):
+            name = self.names[self.i]
+            try:
+                m = self.cache.get(name)
+                if m is None:
+                    m = self.cache[name] = genai.GenerativeModel(name)
+                return m.generate_content(prompt, **kw)
+            except Exception as e:
+                last = e
+                if any(k in str(e).lower() for k in GEMINI_DEAD):
+                    logging.warning(f"[ai] {name} unavailable, next model")
+                    self.i = (self.i + 1) % len(self.names)
+                    continue
+                raise
+        raise last
+
+
 ai_model = None
 if GEMINI_API_KEY and genai:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        ai_model = genai.GenerativeModel(GEMINI_MODEL)
-        logging.info(f"✅ Gemini ready ({GEMINI_MODEL})")
+        ai_model = _AI(gemini_candidates())
+        logging.info(f"✅ Gemini ready ({ai_model.names[:3]})")
     except Exception as e:
         logging.error(f"Gemini init failed: {e}")
+
+STOP = {}
+CHAT_TASKS = {}
+_tl = threading.local()
+NETERR_RE = re.compile(
+    r"timed out|timeout|connection|max retries|unreachable|refused|reset|forbidden|403|429|unable to download|ssl|proxy", re.I
+)
 
 JOBS = {}
 FAILS = {}
@@ -94,11 +178,51 @@ def init_engine():
         shutil.rmtree(os.path.join(DOWNLOAD_DIR, d), ignore_errors=True)
 
 
-def spawn(coro):
+def spawn(coro, chat=None):
     t = asyncio.create_task(coro)
     BG_TASKS.add(t)
     t.add_done_callback(BG_TASKS.discard)
+    if chat is not None:
+        CHAT_TASKS.setdefault(chat, set()).add(t)
+        t.add_done_callback(lambda x, c=chat: CHAT_TASKS.get(c, set()).discard(x))
     return t
+
+
+def stop_event(chat_id):
+    ev = STOP.get(chat_id)
+    if ev is None or ev.is_set():
+        ev = STOP[chat_id] = threading.Event()
+    return ev
+
+
+def cancel_chat(chat_id):
+    ev = STOP.pop(chat_id, None)
+    if ev:
+        ev.set()
+    tasks = [t for t in CHAT_TASKS.get(chat_id, set()) if not t.done()]
+    for t in tasks:
+        t.cancel()
+    return len(tasks)
+
+
+def active_count(chat_id):
+    return len([t for t in CHAT_TASKS.get(chat_id, set()) if not t.done()])
+
+
+def _proxy():
+    return getattr(_tl, "proxy", None) or PROXY_URL
+
+
+def _http_proxy():
+    p = _proxy()
+    return p if p and p.lower().startswith("http") else ""
+
+
+async def cancel_note(msg):
+    try:
+        await msg.edit_text("🛑 <b>Cancel ho gaya.</b>")
+    except Exception:
+        pass
 
 
 def esc(s) -> str:
@@ -340,8 +464,8 @@ def cookie_header(url: str, cookies: list) -> str:
 def make_session(headers: dict, cookies: list):
     s = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "desktop": True})
     s.headers.update(headers or {})
-    if PROXY_URL:
-        s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+    if _proxy():
+        s.proxies = {"http": _proxy(), "https": _proxy()}
     for c in cookies or []:
         try:
             s.cookies.set(c["name"], c["value"], domain=c.get("domain") or None, path=c.get("path") or "/")
@@ -450,8 +574,8 @@ def ffprobe(target, headers=None, timeout=40):
     cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams"]
     if str(target).startswith("http"):
         cmd += ["-rw_timeout", "20000000"]
-        if PROXY_URL:
-            cmd += ["-http_proxy", PROXY_URL]
+        if _http_proxy():
+            cmd += ["-http_proxy", _http_proxy()]
         if headers:
             cmd += ["-headers", _hdr_str(headers)]
     cmd.append(str(target))
@@ -510,6 +634,10 @@ def run_ffmpeg(args, duration=0.0, on_progress=None):
                 try:
                     cur = int(line.split("=", 1)[1]) / 1_000_000
                     on_progress(min(max(cur, 0), duration), duration)
+                except Cancelled:
+                    p.kill()
+                    p.wait()
+                    raise
                 except Exception:
                     pass
         p.wait()
@@ -849,8 +977,8 @@ def cmp_caption(name, r):
 
 
 class Progress:
-    def __init__(self, loop, msg, header=""):
-        self.loop, self.msg, self.header = loop, msg, header
+    def __init__(self, loop, msg, header="", stop=None):
+        self.loop, self.msg, self.header, self.stop = loop, msg, header, stop
         self.t_start = self.t0 = time.time()
         self.cur_stage = ""
         self.last_edit = 0.0
@@ -864,7 +992,12 @@ class Progress:
         gap = 4.5 if force else (7.0 if el < 30 else 11.0 if el < 120 else 15.0)
         return now - self.last_edit >= gap
 
+    def check(self):
+        if self.stop is not None and self.stop.is_set():
+            raise Cancelled()
+
     def update(self, stage, done, total, kind="bytes"):
+        self.check()
         now = time.time()
         changed = stage != self.cur_stage
         if changed:
@@ -890,6 +1023,7 @@ class Progress:
         asyncio.run_coroutine_threadsafe(self._edit(text), self.loop)
 
     async def stage(self, text):
+        self.check()
         self.cur_stage = text
         self.last_edit = time.time()
         await self._edit(f"{self.header}\n⏳ <b>{text}</b>")
@@ -915,6 +1049,9 @@ def base_ydl_opts(headers=None, fast=False, imp="chrome"):
     }
     if headers:
         hdrs.update(headers)
+    cookie_hdr = ""
+    for k in [k for k in hdrs if k.lower() == "cookie"]:
+        cookie_hdr = hdrs.pop(k) or cookie_hdr
     o = {
         "quiet": True, "no_warnings": True, "noplaylist": True, "nocheckcertificate": True,
         "geo_bypass": True, "geo_bypass_country": "US",
@@ -927,16 +1064,29 @@ def base_ydl_opts(headers=None, fast=False, imp="chrome"):
             "generic": {"impersonate": ["chrome"]},
         },
     }
+    if cookie_hdr:
+        o["_cookie_header"] = cookie_hdr
     if COOKIES_USABLE:
         o["cookiefile"] = COOKIES_FILE
-    if PROXY_URL:
-        o["proxy"] = PROXY_URL
+    if _proxy():
+        o["proxy"] = _proxy()
     if FORCE_IPV4:
         o["source_address"] = "0.0.0.0"
     t = None if (NO_IMP or not imp) else impersonate_target(imp)
     if t:
         o["impersonate"] = t
     return o
+
+
+def cookies_from_header(url, header):
+    host = urlparse(url).netloc.split(":")[0]
+    out = []
+    for part in (header or "").split(";"):
+        if "=" not in part:
+            continue
+        n, v = part.strip().split("=", 1)
+        out.append(http.cookiejar.Cookie(0, n, v, None, False, host, True, False, "/", True, False, None, False, None, None, {}))
+    return out
 
 
 def ydl_call(opts, fn, url=None):
@@ -946,6 +1096,8 @@ def ydl_call(opts, fn, url=None):
         with yt_dlp.YoutubeDL(opts) as ydl:
             if url:
                 for c in age_cookies_for(url):
+                    ydl.cookiejar.set_cookie(c)
+                for c in cookies_from_header(url, opts.get("_cookie_header")):
                     ydl.cookiejar.set_cookie(c)
             return fn(ydl)
 
@@ -1617,8 +1769,8 @@ def ffmpeg_stream_download(url, out, headers, duration, prog, hls=False):
     args = []
     if hls:
         args += ["-allowed_extensions", "ALL"]
-    if PROXY_URL:
-        args += ["-http_proxy", PROXY_URL]
+    if _http_proxy():
+        args += ["-http_proxy", _http_proxy()]
     if headers:
         args += ["-headers", _hdr_str(headers)]
     args += ["-i", url, "-c", "copy"]
@@ -1726,6 +1878,28 @@ def choose_tier(src: Source, q: int = 0) -> int:
 
 
 def download_media(src: Source, workdir, prog, q=0, audio=False):
+    try:
+        return _download_media(src, workdir, prog, q, audio)
+    except Cancelled:
+        raise
+    except Exception as e:
+        if not FALLBACK_PROXY or PROXY_URL or not NETERR_RE.search(str(e)):
+            raise
+        logging.warning("[dl] direct failed, retrying via fallback proxy")
+        for f in os.listdir(workdir):
+            _rm(os.path.join(workdir, f))
+        _tl.proxy = FALLBACK_PROXY
+        try:
+            return _download_media(src, workdir, prog, q, audio)
+        except Cancelled:
+            raise
+        except Exception as e2:
+            raise RuntimeError(f"{str(e)[:300]} || proxy: {str(e2)[:300]}")
+        finally:
+            _tl.proxy = None
+
+
+def _download_media(src: Source, workdir, prog, q=0, audio=False):
     tier = choose_tier(src, q)
     errs = []
     target_url = src.alt_urls.get(tier, src.dl_url) if not audio else src.dl_url
@@ -1811,172 +1985,6 @@ def fetch_thumbnail(job: Job):
 
 
 
-# ==========================================================================
-# CENSOR ENGINE  (100% local / offline — NudeNet + OpenCV + Pillow)
-# Kuch bhi cloud/AI par nahi jaata. Sirf jab user khud "Censor" dabaye tab chalta hai.
-# ==========================================================================
-CENSOR_MIN_SCORE = float(os.environ.get("CENSOR_MIN_SCORE", "0.35"))
-CENSOR_SCAN_SEC = float(os.environ.get("CENSOR_SCAN_SEC", "0.5"))
-CENSOR_PAD = float(os.environ.get("CENSOR_PAD", "0.12"))
-
-# Instagram-ish: sirf ye exposed labels chhupate hain (face/arms/belly/male-chest nahi).
-# Dono nudenet naming schemes support (naya "*_EXPOSED" aur purana "EXPOSED_*").
-CENSOR_LABELS = {
-    "BUTTOCKS_EXPOSED", "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED",
-    "ANUS_EXPOSED", "MALE_GENITALIA_EXPOSED",
-    "EXPOSED_ANUS", "EXPOSED_BUTTOCKS", "EXPOSED_BREAST_F",
-    "EXPOSED_GENITALIA_F", "EXPOSED_GENITALIA_M",
-}
-
-_detector = None
-_detector_lock = threading.Lock()
-
-
-def _nudenet():
-    global _detector
-    if _detector is not None:
-        return _detector
-    with _detector_lock:
-        if _detector is None:
-            from nudenet import NudeDetector
-            try:
-                _detector = NudeDetector()          # 320n (fast)
-            except Exception:
-                _detector = NudeDetector("640m")    # bigger fallback
-    return _detector
-
-
-def _detect_raw(src):
-    """Sensitive regions -> [{label, score, box:(x,y,w,h)}]  (empty agar kuch nahi mila).
-    `src` file path ya numpy frame dono chalega."""
-    try:
-        dets = _nudenet().detect(src)
-    except Exception as e:
-        logging.warning(f"[censor] detect fail: {str(e)[:120]}")
-        return []
-    out = []
-    for d in dets or []:
-        label = str(d.get("class") or d.get("label") or "").upper()
-        try:
-            score = float(d.get("score") or 0)
-        except Exception:
-            score = 0.0
-        box = d.get("box") or d.get("bbox")
-        if label in CENSOR_LABELS and score >= CENSOR_MIN_SCORE and box:
-            x, y, w, h = [int(v) for v in box[:4]]
-            if w > 2 and h > 2:
-                out.append({"label": label, "score": score, "box": (x, y, w, h)})
-    return out
-
-
-def _grow_box(box, W, H, pad=None):
-    pad = CENSOR_PAD if pad is None else pad
-    x, y, w, h = box
-    px, py = int(w * pad), int(h * pad)
-    x0, y0 = max(0, x - px), max(0, y - py)
-    x1, y1 = min(W, x + w + px), min(H, y + h + py)
-    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
-
-
-def _avg_color(img, box):
-    """Box ke aas-paas ka average colour (blend mode ke liye)."""
-    x, y, w, h = box
-    W, H = img.size
-    m = max(8, int(0.3 * max(w, h)))
-    sx0, sy0 = max(0, x - m), max(0, y - m)
-    sx1, sy1 = min(W, x + w + m), min(H, y + h + m)
-    strip = img.crop((sx0, sy0, sx1, sy1))
-    if strip.width < 1 or strip.height < 1:
-        return (40, 40, 40)
-    return strip.resize((1, 1)).getpixel((0, 0))
-
-
-def censor_image(src, dst, mode="blur"):
-    """Nudity detect karke image ke sensitive parts blur / blend karta hai."""
-    from PIL import Image, ImageFilter
-    img = Image.open(src).convert("RGB")
-    W, H = img.size
-    dets = _detect_raw(src)
-    for d in dets:
-        x, y, w, h = _grow_box(d["box"], W, H)
-        if mode == "blend":
-            patch = Image.new("RGB", (w, h), _avg_color(img, (x, y, w, h)))
-        else:
-            region = img.crop((x, y, x + w, y + h))
-            radius = max(8, int(min(w, h) * 0.35))
-            patch = region.filter(ImageFilter.GaussianBlur(radius))
-        img.paste(patch, (x, y))
-    img.save(dst, quality=92)
-    return {"path": dst, "found": len(dets), "labels": sorted({d["label"] for d in dets})}
-
-
-def censor_video(src, dst, prog=None, mode="blur"):
-    """Sampled frames par NudeNet, phir OpenCV blur/blend + ffmpeg H.264 mux (audio copy)."""
-    import cv2
-    info = ffprobe(src) or {}
-    cap = cv2.VideoCapture(src)
-    if not cap.isOpened():
-        raise RuntimeError("Censor: video open nahi hui")
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or info.get("width") or 0
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or info.get("height") or 0
-    fps = cap.get(cv2.CAP_PROP_FPS) or info.get("fps") or 25.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or int((info.get("duration") or 0) * fps)
-    if not W or not H:
-        cap.release()
-        raise RuntimeError("Censor: resolution nahi mili")
-    step = max(1, int(round(fps * CENSOR_SCAN_SEC)))
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", f"{fps}", "-i", "-",
-           "-i", src, "-map", "0:v:0", "-map", "1:a:0?",
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-           "-c:a", "copy", "-movflags", "+faststart", dst]
-    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    idx, found, boxes = 0, 0, []
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if idx % step == 0:
-                dets = _detect_raw(frame)          # BGR frame seedha detector ko (no temp file)
-                boxes = [_grow_box(d["box"], W, H) for d in dets]
-                found += len(boxes)
-            for (x, y, w, h) in boxes:
-                roi = frame[y:y + h, x:x + w]
-                if roi.size == 0:
-                    continue
-                if mode == "blend":
-                    roi[:] = roi.reshape(-1, 3).mean(axis=0).astype("uint8")
-                else:
-                    k = max(9, (min(w, h) // 3) | 1)
-                    frame[y:y + h, x:x + w] = cv2.GaussianBlur(roi, (k, k), 0)
-            try:
-                p.stdin.write(frame.tobytes())
-            except BrokenPipeError:
-                break
-            idx += 1
-            if prog and total and idx % (step * 4) == 0:
-                prog.update("🔞 Censoring", idx, total, "time")
-    finally:
-        cap.release()
-        try:
-            p.stdin.close()
-        except Exception:
-            pass
-        p.wait()
-    if p.returncode != 0 or not os.path.exists(dst):
-        raise RuntimeError("Censor encode fail")
-    return {"path": dst, "found": found}
-
-
-def censor_any(path, prog=None, mode="blur"):
-    """File video hai ya image — apne aap decide karke censor karta hai."""
-    info = ffprobe(path) or {}
-    if info.get("vcodec"):
-        return censor_video(path, os.path.splitext(path)[0] + "_censored.mp4", prog, mode)
-    return censor_image(path, os.path.splitext(path)[0] + "_censored.jpg", mode)
-
-
 def post_kb(job: Job) -> InlineKeyboardMarkup:
     """Har bheji gayi video ke saath — Cut / Censor / Thumbnail (sirf jab user khud dabaye)."""
     return InlineKeyboardMarkup([[
@@ -1986,27 +1994,42 @@ def post_kb(job: Job) -> InlineKeyboardMarkup:
     ]])
 
 
-async def run_censor(client, job: Job, mode="blur"):
+async def run_censor(client, job: Job, mode=None):
     global active_downloads
     loop = asyncio.get_running_loop()
     job.busy = True
     msg = job.msg
-    prog = Progress(loop, msg, f"🔞 <b>Censor: {esc(job.src.title[:55])}</b>")
+    prog = Progress(loop, msg, f"🔞 <b>Censor: {esc(job.src.title[:55])}</b>", stop_event(job.chat_id))
     workdir = os.path.join(DOWNLOAD_DIR, f"cz_{job.id}_{int(time.time())}")
     os.makedirs(workdir, exist_ok=True)
     try:
+        if job.src.duration and job.src.duration > CENSOR_MAX_SEC:
+            return await msg.edit_text(
+                f"✂️ Video <code>{int(job.src.duration)}s</code> ki hai. Censor ke liye max "
+                f"<code>{int(CENSOR_MAX_SEC)}s</code> — pehle ✂️ Cut karke chhota hissa lo."
+            )
         async with DL_SEM:
             active_downloads += 1
             try:
                 await prog.stage("⬇️ Video laa raha hoon…")
                 path = await loop.run_in_executor(None, download_media, job.src, workdir, prog, job.q, False)
-                await prog.stage("🔞 Nudity detect + censor (offline)…")
-                r = await loop.run_in_executor(None, censor_any, path, prog, mode)
+                secs = await loop.run_in_executor(None, video_seconds, path)
+                if secs and secs > CENSOR_MAX_SEC:
+                    return await msg.edit_text(
+                        f"✂️ Video <code>{int(secs)}s</code> ki nikli. Censor ke liye max "
+                        f"<code>{int(CENSOR_MAX_SEC)}s</code> — pehle ✂️ Cut karo."
+                    )
+                if ENC_SEM.locked():
+                    await prog.stage("Queue mein hai… (pehla censor khatam hone do)")
+                async with ENC_SEM:
+                    await prog.stage("🔎 Anime/3D nudity scan + censor…")
+                    r = await loop.run_in_executor(None, censor_any, path, prog, mode)
                 info = ffprobe(r["path"]) or {}
                 base = sanitize_filename(job.src.title or "video")
                 cap = (
                     f"🔞 <b>Censored</b>\n\n🎬 <b>Name:</b> <code>{esc(base)}</code>\n"
                     f"🩹 <b>Regions hidden:</b> <code>{r.get('found', 0)}</code>\n"
+                    f"🧠 <b>Detector:</b> <code>{'+'.join(r.get('backends') or [])}</code>\n"
                     f"📦 <b>Size:</b> <code>{humanbytes(os.path.getsize(r['path']))}</code>"
                 )
                 await send_one(
@@ -2019,6 +2042,11 @@ async def run_censor(client, job: Job, mode="blur"):
                     pass
             finally:
                 active_downloads -= 1
+    except Cancelled:
+        await cancel_note(msg)
+    except asyncio.CancelledError:
+        await cancel_note(msg)
+        raise
     except Exception as e:
         logging.exception("censor failed")
         try:
@@ -2030,7 +2058,7 @@ async def run_censor(client, job: Job, mode="blur"):
         job.busy = False
 
 
-async def censor_photo_message(client, message: Message, mode="blur"):
+async def censor_photo_message(client, message: Message, mode=None):
     """User ne image bheji + censor maanga -> download, censor, wapas bhejo."""
     media = message.photo or message.document
     if not media:
@@ -2044,7 +2072,10 @@ async def censor_photo_message(client, message: Message, mode="blur"):
     try:
         path = await client.download_media(media, file_name=os.path.join(workdir, "in.jpg"))
         r = await loop.run_in_executor(None, censor_image, path, os.path.join(workdir, "out.jpg"), mode)
-        cap = f"🔞 <b>Censored image</b>\n🩹 Regions hidden: <code>{r.get('found', 0)}</code>"
+        cap = (
+            f"🔞 <b>Censored image</b>\n🩹 Regions hidden: <code>{r.get('found', 0)}</code>\n"
+            f"🧠 Detector: <code>{'+'.join(r.get('backends') or [])}</code>"
+        )
         m = await client.send_photo(message.chat.id, r["path"], caption=cap, reply_to_message_id=message.id)
         if getattr(m, "id", None):
             remember_sent(message.chat.id, m.id)
@@ -2245,10 +2276,15 @@ async def send_one(client, chat_id, path, fname, caption, info, kb, prog, label,
     )
     if getattr(m, "id", None):
         remember_sent(chat_id, m.id)
+    elif prog.stop is not None and prog.stop.is_set():
+        raise Cancelled()
 
 
 async def _up_progress(current, total, prog, label):
-    prog.update(label, current, total)
+    try:
+        prog.update(label, current, total)
+    except Cancelled:
+        raise StopTransmission()
 
 
 async def run_delivery(client, job: Job, cut, audio=False, compress=None):
@@ -2257,7 +2293,7 @@ async def run_delivery(client, job: Job, cut, audio=False, compress=None):
     job.busy = True
     msg = job.msg
     header = f"🎬 <b>{esc(job.src.title[:70])}</b>" + (f" • {job.q}p" if 0 < job.q < MAX_HEIGHT else "")
-    prog = Progress(loop, msg, header)
+    prog = Progress(loop, msg, header, stop_event(job.chat_id))
     workdir = os.path.join(DOWNLOAD_DIR, f"{job.id}_{int(time.time())}")
     os.makedirs(workdir, exist_ok=True)
     try:
@@ -2334,6 +2370,11 @@ async def run_delivery(client, job: Job, cut, audio=False, compress=None):
                     pass
             finally:
                 active_downloads -= 1
+    except Cancelled:
+        await cancel_note(msg)
+    except asyncio.CancelledError:
+        await cancel_note(msg)
+        raise
     except Exception as e:
         logging.exception("delivery failed")
         try:
@@ -2378,17 +2419,17 @@ async def dispatch_intent(client, job: Job, it: Intent, st):
     if it.q:
         job.q = it.q
     if it.action == "audio":
-        return spawn(run_delivery(client, job, None, True))
+        return spawn(run_delivery(client, job, None, True), job.chat_id)
     if it.action == "compress":
-        return spawn(run_delivery(client, job, None, False, parse_compress_opts(it.arg)))
+        return spawn(run_delivery(client, job, None, False, parse_compress_opts(it.arg)), job.chat_id)
     if it.action == "download":
-        return spawn(run_delivery(client, job, None))
+        return spawn(run_delivery(client, job, None), job.chat_id)
     if it.action == "cut":
         if it.start is not None and it.end is not None and it.end > it.start and not (D and it.start >= D):
             job.cs, job.ce = it.start, (min(it.end, D) if D else it.end)
             if it.mode:
                 job.mode = it.mode
-            return spawn(run_delivery(client, job, (job.cs, job.ce, job.mode)))
+            return spawn(run_delivery(client, job, (job.cs, job.ce, job.mode)), job.chat_id)
         job.cs, job.ce, job.sel, job.fresh = 0.0, D or 600.0, "s", True
         return await st.edit_text(panel_text(job), reply_markup=panel_kb(job))
     await st.edit_text(card_text(job), reply_markup=card_kb(job))
@@ -2443,6 +2484,9 @@ async def analyze_url(client, status_msg: Message, chat_id: int, url: str, reply
         try:
             src = await asyncio.wait_for(resolve_source(url, status), timeout=300)
             await finish_analysis(client, status_msg, chat_id, src, reply_to, intent)
+        except asyncio.CancelledError:
+            await cancel_note(status_msg)
+            raise
         except Exception as e:
             diag = getattr(e, "diag", None)
             try:
@@ -2472,7 +2516,7 @@ async def download_message(client, message: Message, text: str, urls: list):
         st = await message.reply_text(f"🔍 <b>Analyzing…</b>\n<code>{esc(u[:60])}</code>", quote=True)
         if getattr(st, "id", None):
             remember_sent(message.chat.id, st.id)
-        spawn(analyze_url(client, st, message.chat.id, u, message.id, it))
+        spawn(analyze_url(client, st, message.chat.id, u, message.id, it), message.chat.id)
 
 
 async def chat_message(client, message: Message, text: str, start_text: str, help_text: str):
@@ -2525,7 +2569,7 @@ async def compress_run(client, c):
     loop = asyncio.get_running_loop()
     c["busy"] = True
     st = c["st"]
-    prog = Progress(loop, st, f"🗜 <b>Smart Compress: {esc(c['name'][:55])}</b>")
+    prog = Progress(loop, st, f"🗜 <b>Smart Compress: {esc(c['name'][:55])}</b>", stop_event(c["chat"]))
     workdir = os.path.join(DOWNLOAD_DIR, f"cmp_{c['id']}_{int(time.time())}")
     os.makedirs(workdir, exist_ok=True)
     try:
@@ -2551,6 +2595,11 @@ async def compress_run(client, c):
             except Exception:
                 pass
             CJOBS.pop(c["id"], None)
+    except Cancelled:
+        await cancel_note(st)
+    except asyncio.CancelledError:
+        await cancel_note(st)
+        raise
     except Exception as e:
         logging.exception("compress failed")
         try:
@@ -2570,156 +2619,4 @@ async def compress_message(client, message: Message, text: str):
         "chat": message.chat.id,
         "rid": message.id,
         "fid": media.file_id,
-        "name": sanitize_filename(os.path.splitext(fname)[0]),
-        "ext": os.path.splitext(fname)[1] or ".mp4",
-        "size": getattr(media, "file_size", 0) or 0,
-        "dur": getattr(media, "duration", 0) or 0,
-        "w": getattr(media, "width", 0) or 0,
-        "h": getattr(media, "height", 0) or 0,
-        "opts": parse_compress_opts(text),
-        "busy": False,
-        "created": time.time(),
-    }
-    CJOBS[c["id"]] = c
-    st = await message.reply_text(
-        f"🗜 <b>Fixed Smart Compression Starting…</b>\n"
-        f"🎬 <code>{esc(c['name'][:70])}</code>\n"
-        f"📦 Original Size: <code>{humanbytes(c['size'])}</code>\n"
-        f"✨ Mode: <code>Visual Lossless (SSIM 0.985 Lock)</code>",
-        quote=True
-    )
-    if getattr(st, "id", None):
-        remember_sent(message.chat.id, st.id)
-    c["st"] = st
-    spawn(compress_run(client, c))
-
-
-async def handle_callback(client, cq: CallbackQuery):
-    parts = (cq.data or "").split(":")
-    act = parts[0]
-    if len(parts) > 1 and not parts[1].startswith(INSTANCE):
-        try:
-            await cq.answer("⌛ Ye request purani ho gayi — link dobara bhejo.", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    if act in ("tc", "gm"):
-        f = FAILS.get(parts[1]) if len(parts) > 1 else None
-        if not f:
-            return await cq.answer("⌛ Ye request purani ho gayi — link dobara bhejo.", show_alert=True)
-        await cq.answer("⏳ Check kar raha hoon…")
-        return spawn(retry_failed(client, cq.message, f, act, parts[2] if len(parts) > 2 else ""))
-
-    job = JOBS.get(parts[1]) if len(parts) > 1 else None
-    if not job:
-        return await cq.answer("⌛ Ye request purani ho gayi — link dobara bhejo.", show_alert=True)
-    chat = cq.message.chat.id
-
-    if act == "th":
-        if job.thumb_sent:
-            return await cq.answer("🖼 Thumbnail pehle hi bhej di hai")
-        job.thumb_sent = True
-        await cq.answer("🖼 HD thumbnail la raha hoon…")
-        loop = asyncio.get_running_loop()
-        path = await loop.run_in_executor(None, fetch_thumbnail, job)
-        if not path:
-            job.thumb_sent = False
-            m = await client.send_message(chat, "❌ Is video ka thumbnail nahi mil paaya.", reply_to_message_id=job.reply_to)
-            if getattr(m, "id", None):
-                remember_sent(chat, m.id)
-            return
-        try:
-            m = await client.send_document(
-                chat, path, caption=f"🖼 <b>{esc(job.src.title[:100])}</b>",
-                file_name=f"{sanitize_filename(job.src.title)}{os.path.splitext(path)[1] or '.jpg'}",
-                force_document=True, reply_to_message_id=job.reply_to
-            )
-            if getattr(m, "id", None):
-                remember_sent(chat, m.id)
-        except Exception:
-            job.thumb_sent = False
-        return
-
-    if job.busy:
-        return await cq.answer("⏳ Ye video abhi download/process ho rahi hai…", show_alert=False)
-
-    async def refresh():
-        try:
-            await cq.message.edit_text(panel_text(job), reply_markup=panel_kb(job))
-        except Exception:
-            pass
-
-    if act == "dl":
-        if len(parts) > 2 and parts[2].isdigit():
-            job.q = int(parts[2])
-        q_label = f"{job.q}p" if job.q else "Best"
-        await cq.answer(f"⬇️ Downloading ({q_label})…")
-        return spawn(run_delivery(client, job, None))
-    if act == "au":
-        await cq.answer("🎵 Audio extraction shuru…")
-        return spawn(run_delivery(client, job, None, True))
-    if act == "zp":
-        await cq.answer("🗜 Smart Compress shuru…")
-        return spawn(run_delivery(client, job, None, False, parse_compress_opts("")))
-    if act == "cx":
-        await cq.answer()
-        return await cq.message.edit_text(card_text(job), reply_markup=card_kb(job))
-    if act == "cg":
-        D = job.src.duration
-        if job.ce - job.cs < 1 or (D and job.cs >= D):
-            return await cq.answer("⚠️ Start/End time sahi daalo", show_alert=True)
-        await cq.answer("✂️ Cut + Download shuru…")
-        return spawn(run_delivery(client, job, (job.cs, min(job.ce, D) if D else job.ce, job.mode)))
-    if act == "pc":
-        await cq.answer("✂️ Cut panel khol raha hoon…")
-        job.cs, job.ce, job.sel, job.fresh = 0.0, job.src.duration or 600.0, "s", True
-        return await refresh()
-    if act == "pz":
-        await cq.answer("🔞 Censor (blur) shuru…")
-        return spawn(run_censor(client, job, "blur"))
-    if act == "pb":
-        await cq.answer("🎨 Censor (blend) shuru…")
-        return spawn(run_censor(client, job, "blend"))
-    if act == "cut":
-        job.cs, job.ce, job.sel, job.fresh = 0.0, job.src.duration or 600.0, "s", True
-    elif act == "cs":
-        job.sel, job.fresh = parts[2], True
-    elif act == "cd":
-        push(job, parts[2])
-    elif act == "cb":
-        push(job, None)
-    elif act == "cc":
-        setattr(job, "cs" if job.sel == "s" else "ce", 0.0)
-        job.fresh = True
-    elif act == "cf":
-        job.ce = job.src.duration or job.ce
-    elif act == "cm":
-        job.mode = "fast" if job.mode == "exact" else "exact"
-    elif act == "cq":
-        cyc = [0] + [h for h, _ in quality_options(job.src) if h]
-        job.q = cyc[(cyc.index(job.q) + 1) % len(cyc)] if job.q in cyc else 0
-    await cq.answer()
-    await refresh()
-
-
-async def janitor():
-    while True:
-        await asyncio.sleep(600)
-        now = time.time()
-        for jid, job in list(JOBS.items()):
-            if now - job.created > 6 * 3600 and not job.busy:
-                JOBS.pop(jid, None)
-                for f in os.listdir(THUMB_DIR):
-                    if f.startswith(jid + "_"):
-                        _rm(os.path.join(THUMB_DIR, f))
-        for fid, f in list(FAILS.items()):
-            if now - f["created"] > 6 * 3600:
-                FAILS.pop(fid, None)
-        for cid, c in list(CJOBS.items()):
-            if now - c["created"] > 6 * 3600 and not c["busy"]:
-                CJOBS.pop(cid, None)
-        for d in os.listdir(DOWNLOAD_DIR):
-            p = os.path.join(DOWNLOAD_DIR, d)
-            if os.path.isdir(p) and now - os.path.getmtime(p) > 4 * 3600:
-                shutil.rmtree(p, ignore_errors=True)
+        "name": sanitize_filename(os.pa
