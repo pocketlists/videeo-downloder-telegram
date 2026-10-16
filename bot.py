@@ -3,11 +3,12 @@ import re
 import sys
 import time
 import json
+import random
 import shutil
 import asyncio
 import logging
-import secrets
 import subprocess
+from collections import deque
 from datetime import datetime
 from difflib import get_close_matches
 
@@ -22,12 +23,13 @@ if os.environ.get("AUTO_UPDATE", "1") == "1":
 
 from pyrogram import Client, filters, enums, idle
 from pyrogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 )
 
 import modules.video_engine as ve
+import modules.censor_engine as cen
 from modules.post_maker import (
-    SENT_BY_BOT, esc, is_bot_template, extract_urls, media_of,
+    SENT_BY_BOT, POST_GAP, esc, is_bot_template, is_post_only_links, extract_urls, media_of,
     is_video_media, remember_sent, safe, post_message, album_post, template_reply,
 )
 from modules.video_engine import (
@@ -35,28 +37,24 @@ from modules.video_engine import (
     download_message, chat_message, compress_message, handle_callback, janitor,
 )
 
-# --------------------------------------------------------------------- config
 API_ID = int(os.environ.get("API_ID", 0) or 0)
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ALLOWED = {int(x) for x in re.findall(r"\d+", os.environ.get("ALLOWED_IDS", ""))}
 STALE_SEC = int(os.environ.get("STALE_SEC", 25))
-
-# Ek saath aaye messages ko ek "batch" maana jaata hai (timing se, link se nahi)
-BATCH_WINDOW = float(os.environ.get("BATCH_WINDOW", 4.0))
-BATCH_TTL = int(os.environ.get("BATCH_TTL", 3600))
-# auto  = single message ho to bot khud decide kare, 2+ ho to ek baar poochhe
-# always= har baar poochhe
-ASK_MODE = os.environ.get("ASK_MODE", "auto").lower()
+TEXT_WINDOW = float(os.environ.get("TEXT_WINDOW", 1.8))
 
 START_TS = 0.0
 SEEN = {}
-BATCHES = {}
-CHAT_BATCH = {}
-BATCH_TASKS = {}
+CHAT_Q = {}
+CHAT_WORKERS = {}
+TEXT_BUF = {}
+TEXT_TASKS = {}
+HISTORY = {}
+LAST_LOCAL = {}
 
 COMMANDS = ["start", "help", "queue", "download", "compress", "censor",
-            "post", "cut", "template", "status", "ai"]
+            "post", "cut", "template", "status", "ai", "cancel", "stop"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -74,42 +72,46 @@ except TypeError:
 START_TEXT = (
     "👋 <b>Seal Video Downloader + Post Maker + Smart Compressor + Censor</b>\n\n"
     "<b>1️⃣ Video Download:</b> Kisi bhi website ka link bhejo. Quality buttons + ✂️ Cut + 🎵 Audio.\n"
-    "<b>2️⃣ Post Maker:</b> Diskwala/Terabox + Telegram links media ke saath bhejo — ek saaf post banega.\n"
+    "<b>2️⃣ Post Maker:</b> Media + links bhejo (ya sirf Diskwala/Terabox/Telegram links) — har message ka apna alag post.\n"
     "<b>3️⃣ Auto Compress:</b> Video file bhejo — SSIM 0.985 lock ke saath size kam.\n"
-    "<b>4️⃣ Censor (offline):</b> Video/image par nudity detect karke blur — sirf jab tum dabao.\n\n"
-    "🗣 Baat AI se bhi kar sakte ho, ya <code>/</code> commands: /download /compress /censor /post /cut"
+    "<b>4️⃣ Censor:</b> Anime 2D/3D + real video/image par mosaic — sirf jab tum dabao ya <code>/censor</code> likho.\n\n"
+    "🛑 Kuch galat chal raha ho to <code>/cancel</code> (ya sirf <code>cancel</code> likho) — sab kuch ruk jayega.\n"
+    "🗣 Baat AI se bhi kar sakte ho, ya <code>/</code> commands: /download /compress /censor /post /cut /cancel"
 )
 
 HELP_TEXT = (
     "<b>📖 Kaise use karein</b>\n\n"
     "• <b>Link bhejo</b> → quality button chuno.\n"
-    "• <b>Video file bhejo</b> → compress ka option, ya seedha compress.\n"
-    "• <b>Image/Video + link</b> → post maker.\n"
-    "• <b>Censor</b>: video/image par <code>🔞 Censor</code> dabao (offline nudity blur).\n"
-    "• <b>Commands:</b> /download /compress /censor /post /cut /template /status\n"
-    "• <b>Ek saath kai message</b> bhejo → bot ek hi baar poochhega kya karna hai."
+    "• <b>Video file bhejo</b> → compress. Caption mein <code>censor</code> likho to censor.\n"
+    "• <b>Image/Video + link</b> → post maker (har message ka alag post).\n"
+    "• <b>Sirf Diskwala/Terabox links</b> → har link ka alag post.\n"
+    "• <b>Censor</b>: video/image par <code>/censor</code> reply karo. Style: <code>/censor mosaic</code>, "
+    "<code>blur</code>, <code>black</code>, <code>blend</code>. Video max "
+    f"<code>{int(cen.CENSOR_MAX_SEC)}s</code>.\n"
+    "• <b>Roko:</b> <code>/cancel</code> ya <code>/stop</code> — chal rahe kaam + queue dono band.\n"
+    "• <b>Commands:</b> /download /compress /censor /post /cut /template /status /cancel"
 )
 
-# ============================================================== AI command brain
-# Gemini sirf TEXT/command samajhne ke liye. Adult media kabhi AI ko nahi jaata.
 AI_ACTIONS = ("download", "compress", "censor", "cut", "audio", "post",
-              "template", "status", "help", "start", "chat", "none")
+              "template", "status", "help", "start", "cancel", "chat", "none")
 
 AI_BRAIN = (
-    "You are the control brain of a Telegram video-downloader bot. The owner writes in "
+    "You are the control brain and friendly chat partner of a Telegram video bot. The owner writes in "
     "Hinglish, Hindi or English, often with spelling mistakes — understand the intent anyway. "
     "NEVER describe, mention or discuss adult/explicit content; just handle the command silently. "
+    "If the owner wants everything stopped (ruk, bas, stop, cancel, band karo) use action cancel. "
+    "For normal conversation use action chat and put a helpful, natural answer in reply. "
     "Reply with ONLY a JSON object (no markdown):\n"
     '{"action": one of ' + str(list(AI_ACTIONS)) + ', "quality": integer video height or 0, '
     '"start": "HH:MM:SS" or null, "end": "HH:MM:SS" or null, '
     '"mode": "exact" or "fast" or null, "arg": string or null, '
-    '"reply": "one short natural Hinglish line (vary it every time)"}'
+    '"reply": "one or two short natural Hinglish sentences (vary wording every time)"}'
 )
 
 FUZZY = {
     "download": ["download", "downlod", "dwnld", "dload", "bhej", "bhejo", "laao", "lelo", "get", "link"],
     "compress": ["compress", "compres", "cmprs", "shrink", "chhota", "small", "size"],
-    "censor": ["censor", "censr", "sensor", "blur", "blurr", "hide", "dhak", "chhupa"],
+    "censor": ["censor", "censr", "sensor", "blur", "blurr", "hide", "dhak", "chhupa", "mosaic"],
     "cut": ["cut", "kat", "kaat", "kata", "trim", "clip"],
     "audio": ["audio", "mp3", "m4a", "gana", "gaana", "song", "music", "sound"],
     "post": ["post", "tamplet", "tempalte"],
@@ -117,6 +119,35 @@ FUZZY = {
     "help": ["help", "madad", "kaise", "how"],
     "start": ["start", "shuru", "hi", "hello", "hey", "namaste"],
 }
+
+CANCEL_RE = re.compile(
+    r"^\s*/?(?:cancel|stop|ruk+o*|ruk\s*ja+o|rok+o*|rok\s*do|band|band\s*kar(?:o|\s*do)|bas|bas\s*kar(?:o|\s*do)|"
+    r"cancel\s*kar(?:o|\s*do)|sab\s*(?:cancel|band|stop)(?:\s*kar(?:o|\s*do))?)\s*[.!]*\s*$",
+    re.I,
+)
+
+GREET = [
+    "Hey! 👋 Link, video ya image bhejo — baaki main sambhal lunga.",
+    "Namaste! Kya download ya process karna hai aaj?",
+    "Hello ji 😊 Link bhejo ya video file do, kaam shuru karte hain.",
+    "Hii! Bolo, kis cheez mein madad chahiye?",
+]
+THANKS = ["Koi baat nahi 😊", "Anytime! Aur kuch chahiye to bolo.", "Welcome ji 🙌", "Mazaa aaya madad karke 👍"]
+HOWRU = [
+    "Bilkul mast! Tum batao, aaj kya karna hai?",
+    "Ekdum fit 😄 Link ya video bhejo, shuru karte hain.",
+    "Badhiya hoon! Kaam batao.",
+]
+ABOUT = [
+    "Main link se video download, compress, cut, audio, censor aur post bana sakta hoon. /help dekho.",
+    "Download, compress, cut, censor aur post — sab kar leta hoon. Bas link ya file bhejo.",
+]
+OKAY = ["👍", "Theek hai 👌", "Done ✅", "Okk 🙂"]
+FALLBACK = [
+    "Samajh nahi aaya — link/video bhejo ya /help dekho.",
+    "Thoda aur saaf batao? Link bhejo, ya likho jaise <code>720p mein download</code>.",
+    "Mujhe iska matlab nahi mila. /help se commands dekh sakte ho.",
+]
 
 
 def _tsec(v):
@@ -129,6 +160,44 @@ def _tsec(v):
         return ve.to_sec(s) if ":" in s else float(s)
     except Exception:
         return None
+
+
+def hist(chat):
+    return HISTORY.setdefault(chat, deque(maxlen=10))
+
+
+CMD_WORDS = re.compile(
+    r"\d{3,4}\s*p\b|\b(download|dl|cut|compress|audio|mp3|censor|template|status|queue|trim|link)\b|\d+:\d+", re.I
+)
+
+
+def conv_pool(text):
+    t = (text or "").lower().strip()
+    if len(re.findall(r"\w+", t)) > 6 or CMD_WORDS.search(t):
+        return None
+    if re.search(r"\b(thanks|thank you|thx|tnx|shukriya|dhanyavad|thanku)\b", t):
+        return THANKS
+    if re.search(r"\b(kaise ho|kaisa hai|kaisi ho|kya haal|how are you|wassup|sup)\b", t):
+        return HOWRU
+    if re.search(r"\b(kaun ho|who are you|kya kar sakte|kya kya|what can you do|tum kya)\b", t):
+        return ABOUT
+    if re.fullmatch(r"\W*(ok|okay|k|hmm+|accha|acha|theek|thik|haan|ha|hn|done)\W*", t):
+        return OKAY
+    if re.match(r"\W*(hi+|hello|hey|heyy+|namaste|yo)\b", t):
+        return GREET
+    return None
+
+
+def pick_reply(chat, pool):
+    last = LAST_LOCAL.get(chat)
+    choices = [x for x in pool if x != last] or pool
+    r = random.choice(choices)
+    LAST_LOCAL[chat] = r
+    return r
+
+
+def local_chat(chat, text):
+    return pick_reply(chat, conv_pool(text) or FALLBACK)
 
 
 async def ai_generate(prompt, temperature=0.9, timeout=25):
@@ -154,6 +223,7 @@ async def ai_generate(prompt, temperature=0.9, timeout=25):
 def _ctx(message):
     job = ve.JOBS.get(ve.LAST.get(message.chat.id))
     return {
+        "chat": message.chat.id,
         "has_links": bool(extract_urls(message)),
         "media": (media_of(message)[0] or ""),
         "last_title": job.src.title if job else "",
@@ -177,16 +247,19 @@ def normalize_ai(d):
     it["arg"] = re.sub(r"[^\w]", "", str(d.get("arg") or ""))[:12].lower()
     if it["arg"] == "random":
         it["arg"] = "0"
-    it["reply"] = str(d.get("reply") or "").strip()[:300]
+    it["reply"] = str(d.get("reply") or "").strip()[:400]
     return it
 
 
 async def ai_intent(text, ctx):
     if not ve.ai_model or len((text or "").strip()) < 2:
         return None
-    prompt = (AI_BRAIN + f"\nContext: has_links={ctx['has_links']}, media={ctx['media'] or 'none'}, "
-              f"last_title={ctx['last_title'] or 'none'}\nOwner message: {text}")
-    out = await ai_generate(prompt, temperature=0.4)
+    recent = "\n".join(hist(ctx["chat"]))
+    prompt = (
+        AI_BRAIN + f"\nContext: has_links={ctx['has_links']}, media={ctx['media'] or 'none'}, "
+        f"last_title={ctx['last_title'] or 'none'}\nRecent chat:\n{recent or '(none)'}\nOwner message: {text}"
+    )
+    out = await ai_generate(prompt, temperature=0.5)
     if not out:
         return None
     m = re.search(r"\{.*\}", out, re.S)
@@ -214,10 +287,13 @@ def fuzzy_action(text):
 
 
 async def ai_or_rule(text, ctx):
-    """Pehle AI (spelling-tolerant, smart), warna local rule + fuzzy fallback."""
     d = await ai_intent(text, ctx)
     if d:
         return d
+    pool = conv_pool(text)
+    if pool and not ctx["has_links"]:
+        return {"action": "chat", "q": 0, "start": None, "end": None, "mode": "", "arg": "",
+                "reply": pick_reply(ctx["chat"], pool)}
     base = rule_intent(text, ctx["has_links"])
     it = {"action": base.action, "q": base.q, "start": base.start, "end": base.end,
           "mode": base.mode, "arg": base.arg, "reply": base.reply}
@@ -231,18 +307,19 @@ async def ai_or_rule(text, ctx):
 async def ai_free_reply(text, ctx):
     if not ve.ai_model:
         return None
+    recent = "\n".join(hist(ctx["chat"]))
     prompt = (
-        "You are a friendly Telegram bot assistant. The owner chats in Hinglish/Hindi/English. "
-        "Reply in ONE short Hinglish line (max ~18 words). VARY the wording every time — never repeat "
-        "the same line. NEVER mention or describe adult/explicit content. Be warm and brief. "
-        "The bot can: download video from a link, compress video, censor (blur) nudity, cut clips, "
-        "extract audio, and make posts.\n"
-        f"Owner: {text}"
+        "You are a friendly, witty Telegram bot assistant chatting with its owner in Hinglish/Hindi/English. "
+        "Answer the message naturally and helpfully in 1-3 short sentences (max ~40 words). "
+        "Match the owner's language and mood. VARY the wording — never repeat earlier replies. "
+        "NEVER mention or describe adult/explicit content. "
+        "The bot can: download video from a link, compress video, censor (mosaic) nudity in anime/real videos, "
+        "cut clips, extract audio, make posts, and /cancel everything.\n"
+        f"Recent chat:\n{recent or '(none)'}\nOwner: {text}"
     )
     return await ai_generate(prompt, temperature=1.0)
 
 
-# ============================================================== anti-loop filter
 async def _allowed(_, __, update):
     if getattr(update, "outgoing", False):
         return False
@@ -258,140 +335,73 @@ async def _allowed(_, __, update):
 allowed = filters.create(_allowed)
 
 
-# ============================================================== batch helpers
-def _new_batch_id():
-    return ve.INSTANCE + secrets.token_hex(3)
-
-
-def _fingerprint(message):
-    text = re.sub(r"\s+", " ", (message.text or message.caption or "").strip().lower())
-    kind, fid = media_of(message)
-    return (kind or "", fid or "", text[:200])
-
-
-def _dups_in(msgs):
-    seen, dups = {}, []
-    for m in msgs:
-        fp = _fingerprint(m)
-        if fp in seen:
-            dups.append(m.id)
-        else:
-            seen[fp] = m.id
-    return dups
-
-
-def _find_msg(msgs, kinds):
-    for m in msgs:
-        k, _ = media_of(m)
-        if k in kinds:
-            return m
-    return None
-
-
 def _sweep(now):
     for k in [k for k, v in list(SEEN.items()) if now - v > 900]:
         SEEN.pop(k, None)
-    for bid in [b for b, v in list(BATCHES.items()) if v.get("expires") and now > v["expires"]]:
-        BATCHES.pop(bid, None)
-        BATCH_TASKS.pop(bid, None)
 
 
-async def _finalize_later(bid):
-    try:
-        await asyncio.sleep(BATCH_WINDOW + 0.3)
-    except asyncio.CancelledError:
-        return
-    await _finalize_batch(bid)
-
-
-async def intake(client, message):
-    chat = message.chat.id
-    now = time.time()
-    bid = CHAT_BATCH.get(chat)
-    if bid and bid in BATCHES and now - BATCHES[bid]["last"] <= BATCH_WINDOW:
-        b = BATCHES[bid]
-    else:
-        bid = _new_batch_id()
-        b = {"id": bid, "chat": chat, "msgs": [], "links": [], "media": set(),
-             "created": now, "last": now, "done": False, "expires": 0.0}
-        BATCHES[bid] = b
-        CHAT_BATCH[chat] = bid
-    b["last"] = now
-    b["msgs"].append(message)
-    for u in extract_urls(message):
-        if u not in b["links"]:
-            b["links"].append(u)
-    k, _ = media_of(message)
-    if k:
-        b["media"].add(k)
-    old = BATCH_TASKS.get(bid)
-    if old and not old.done():
-        old.cancel()
-    BATCH_TASKS[bid] = asyncio.create_task(_finalize_later(bid))
-
-
-async def _finalize_batch(bid):
-    b = BATCHES.get(bid)
-    if not b or b["done"]:
-        return
-    b["done"] = True
-    b["expires"] = time.time() + BATCH_TTL
-    msgs = b["msgs"]
-    dups = _dups_in(msgs)
-    if len(msgs) >= 2 or ASK_MODE == "always":
-        await _ask_menu(b, dups)
-    else:
-        await _auto_decide(b, dups)
-
-
-# ============================================================== ask menu
-def _ask_kb(b: dict):
-    bid = b["id"]
-    rows = []
-    if b["links"]:
-        rows.append([InlineKeyboardButton("⬇️ Download link(s)", callback_data=f"a:d:{bid}")])
-    if b["media"] & {"video", "document"}:
-        rows.append([InlineKeyboardButton("🗜 Compress video", callback_data=f"a:c:{bid}")])
-        rows.append([InlineKeyboardButton("🔞 Censor video", callback_data=f"a:z:{bid}")])
-    if "photo" in b["media"]:
-        rows.append([InlineKeyboardButton("🔞 Censor image", callback_data=f"a:zi:{bid}")])
-    if b["links"] and b["media"]:
-        rows.append([InlineKeyboardButton("📝 Make Post", callback_data=f"a:p:{bid}")])
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"a:x:{bid}")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def _ask_menu(b, dups):
-    first = b["msgs"][0]
-    kinds = ", ".join(sorted(b["media"])) or "koi media nahi"
-    lines = [f"🤔 <b>{len(b['msgs'])} message mile ek saath.</b>",
-             f"🔗 Links: <code>{len(b['links'])}</code>  •  📎 Media: <code>{kinds}</code>"]
-    if dups:
-        lines.append(f"🔁 Same message dobara aaya: <code>{len(dups)}</code>")
-    lines.append("\n<b>Kya karna hai?</b>")
-    m = await safe(first.reply_text, "\n".join(lines), reply_markup=_ask_kb(b), quote=True)
+async def _reply(message, text, **kw):
+    m = await safe(message.reply_text, text, quote=True, **kw)
     if getattr(m, "id", None):
-        remember_sent(b["chat"], m.id)
+        remember_sent(message.chat.id, m.id)
+    return m
 
 
-async def _auto_decide(b, dups):
-    message = b["msgs"][0]
-    if dups:
-        m = await safe(message.reply_text, "🔁 Ye message pehle bhi aaya tha — skip kar raha hoon.", quote=True)
-        if getattr(m, "id", None):
-            remember_sent(b["chat"], m.id)
-        return
+def cancel_pending(chat):
+    dropped = 0
+    q = CHAT_Q.get(chat)
+    while q is not None and not q.empty():
+        try:
+            q.get_nowait()
+            dropped += 1
+        except asyncio.QueueEmpty:
+            break
+    dropped += len(TEXT_BUF.pop(chat, []))
+    t = TEXT_TASKS.pop(chat, None)
+    if t and not t.done():
+        t.cancel()
+    w = CHAT_WORKERS.get(chat)
+    if w and not w.done() and w is not asyncio.current_task():
+        w.cancel()
+        CHAT_WORKERS.pop(chat, None)
+    return dropped
+
+
+async def do_cancel(client, message):
+    chat = message.chat.id
+    dropped = cancel_pending(chat)
+    stopped = ve.cancel_chat(chat)
+    await _reply(
+        message,
+        f"🛑 <b>Sab ruk gaya.</b>\n• Queue se hataye: <code>{dropped}</code>\n"
+        f"• Chal rahe kaam band: <code>{stopped}</code>\n\nNaya link/media bhejo jab chaho."
+    )
+
+
+def _is_post_links(links):
+    return is_post_only_links(links)
+
+
+async def process_message(message):
     text = message.text or message.caption or ""
-    kind, _ = media_of(message)
-    if kind and b["links"]:
-        return await post_message(app, message, b["links"], kind, media_of(message)[1])
+    links = extract_urls(message)
+    kind, fid = media_of(message)
+    wants_censor = bool(kind) and not links and fuzzy_action(text) == "censor"
+    if kind and links:
+        return await post_message(app, message, links, kind, fid)
+    if wants_censor and kind == "photo":
+        return await ve.censor_photo_message(app, message, None)
+    if wants_censor and is_video_media(message):
+        return await censor_uploaded_video(app, message, None)
     if kind and is_video_media(message):
         return await compress_message(app, message, text)
     if kind == "photo":
         return await _ask_photo(message)
-    if b["links"]:
-        return await download_message(app, message, text, b["links"])
-    if (text or "").strip():
+    if links:
+        if _is_post_links(links):
+            return await post_message(app, message, links, None, None)
+        return await download_message(app, message, text, links)
+    if text.strip():
         return await smart_chat(app, message, text)
     return None
 
@@ -400,123 +410,163 @@ async def _ask_photo(message):
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔞 Censor image", callback_data=f"pz:img:{message.id}"),
     ]])
-    m = await safe(message.reply_text, "🖼 Ye image hai. Kya karna hai?", reply_markup=kb, quote=True)
-    if getattr(m, "id", None):
-        remember_sent(message.chat.id, m.id)
+    await _reply(message, "🖼 Ye image hai. Kya karna hai?", reply_markup=kb)
 
 
-# ============================================================== ask callbacks
-async def handle_ask(client, cq: CallbackQuery, act, bid):
-    b = BATCHES.get(bid)
-    if not b:
-        return await cq.answer("⌛ Ye request purani ho gayi — dobara bhejo.", show_alert=True)
-    msgs = b["msgs"]
-    first = msgs[0]
-    text = first.text or first.caption or ""
-    if act == "x":
-        BATCHES.pop(bid, None)
-        await cq.answer()
+async def _handle(item):
+    kind, payload = item
+    if kind == "album":
+        return await album_post(app, payload)
+    if kind == "chat":
+        texts = [(m.text or "").strip() for m in payload if (m.text or "").strip()]
+        if texts:
+            return await smart_chat(app, payload[-1], "\n".join(texts))
+        return None
+    return await process_message(payload)
+
+
+async def _worker(chat):
+    q = CHAT_Q[chat]
+    while True:
         try:
-            await cq.message.delete()
-        except Exception:
-            pass
+            item = await asyncio.wait_for(q.get(), timeout=90)
+        except asyncio.TimeoutError:
+            return
+        try:
+            await _handle(item)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.exception("handler failed")
+            target = item[1][-1] if item[0] == "chat" else item[1]
+            try:
+                await _reply(target, f"❌ <code>{esc(str(e)[:200])}</code>")
+            except Exception:
+                pass
+        await asyncio.sleep(POST_GAP)
+
+
+def _enqueue(chat, item):
+    q = CHAT_Q.get(chat)
+    if q is None:
+        q = CHAT_Q[chat] = asyncio.Queue()
+    q.put_nowait(item)
+    w = CHAT_WORKERS.get(chat)
+    if w is None or w.done():
+        CHAT_WORKERS[chat] = asyncio.create_task(_worker(chat))
+
+
+async def _flush_text_later(chat):
+    try:
+        await asyncio.sleep(TEXT_WINDOW)
+    except asyncio.CancelledError:
         return
-    await cq.answer("✅ Theek hai…")
-    BATCHES.pop(bid, None)
-    if act == "d":
-        if b["links"]:
-            await download_message(client, first, text, b["links"])
-    elif act == "c":
-        vm = _find_msg(msgs, {"video", "document"})
-        if vm:
-            await compress_message(client, vm, vm.caption or "")
-    elif act == "z":
-        vm = _find_msg(msgs, {"video", "document"})
-        if vm:
-            await censor_uploaded_video(client, vm, "blur")
-    elif act == "zi":
-        pm = _find_msg(msgs, {"photo"})
-        if pm:
-            await ve.censor_photo_message(client, pm, "blur")
-    elif act == "p":
-        if b["links"]:
-            pm = _find_msg(msgs, {"photo", "video", "animation", "document"}) or first
-            k, fid = media_of(pm)
-            await post_message(client, pm, b["links"], k, fid)
+    msgs = TEXT_BUF.pop(chat, [])
+    TEXT_TASKS.pop(chat, None)
+    if msgs:
+        _enqueue(chat, ("chat", msgs))
 
 
-# ============================================================== censor an uploaded video
-async def censor_uploaded_video(client, message: Message, mode="blur"):
-    media = message.video or message.document
+async def intake(message):
+    chat = message.chat.id
+    kind, _ = media_of(message)
+    if kind or extract_urls(message):
+        return _enqueue(chat, ("msg", message))
+    TEXT_BUF.setdefault(chat, []).append(message)
+    old = TEXT_TASKS.get(chat)
+    if old and not old.done():
+        old.cancel()
+    TEXT_TASKS[chat] = asyncio.create_task(_flush_text_later(chat))
+
+
+async def censor_uploaded_video(client, message: Message, style=None):
+    media = message.video or message.animation or message.document
     if not media:
         return
+    chat = message.chat.id
+    dur = getattr(media, "duration", 0) or 0
+    if dur and dur > cen.CENSOR_MAX_SEC:
+        return await _reply(
+            message,
+            f"✂️ Video <code>{int(dur)}s</code> ki hai. Censor ke liye max "
+            f"<code>{int(cen.CENSOR_MAX_SEC)}s</code> — pehle chhoti karo."
+        )
     loop = asyncio.get_running_loop()
-    st = await message.reply_text("🔞 Video censor ho rahi hai (offline)…", quote=True)
-    if getattr(st, "id", None):
-        remember_sent(message.chat.id, st.id)
-    workdir = os.path.join("./downloads/", f"cv_{int(time.time())}")
+    st = await _reply(message, "🔞 Censor shuru ho raha hai…")
+    prog = ve.Progress(loop, st, "🔞 <b>Censor</b>", ve.stop_event(chat))
+    workdir = os.path.join("./downloads/", f"cv_{int(time.time())}_{message.id}")
     os.makedirs(workdir, exist_ok=True)
     try:
-        path = await client.download_media(media, file_name=os.path.join(workdir, "in.mp4"))
-        r = await loop.run_in_executor(None, ve.censor_any, path, None, mode)
-        info = ve.ffprobe(r["path"]) or {}
-        name = ve.sanitize_filename(os.path.splitext(getattr(media, "file_name", None) or "video.mp4")[0])
-        cap = f"🔞 <b>Censored</b>\n🩹 Regions hidden: <code>{r.get('found', 0)}</code>"
-        m = await client.send_video(
-            message.chat.id, r["path"], caption=cap, file_name=f"{name}_censored.mp4",
-            supports_streaming=True, duration=int(info.get("duration") or 0),
-            reply_to_message_id=message.id
-        )
-        if getattr(m, "id", None):
-            remember_sent(message.chat.id, m.id)
+        if ve.ENC_SEM.locked():
+            await prog.stage("Queue mein hai… (pehla censor khatam hone do)")
+        async with ve.ENC_SEM:
+            await prog.stage("⬇️ Video download ho rahi hai…")
+            path = await client.download_media(
+                media, file_name=os.path.join(workdir, "in.mp4"),
+                progress=ve._up_progress, progress_args=(prog, "⬇️ Downloading Video")
+            )
+            if not path:
+                raise ve.Cancelled()
+            secs = await loop.run_in_executor(None, cen.video_seconds, path)
+            if secs and secs > cen.CENSOR_MAX_SEC:
+                return await st.edit_text(
+                    f"✂️ Video <code>{int(secs)}s</code> ki nikli. Censor ke liye max "
+                    f"<code>{int(cen.CENSOR_MAX_SEC)}s</code> — pehle chhoti karo."
+                )
+            await prog.stage("🔎 Anime/3D nudity scan + censor…")
+            r = await loop.run_in_executor(None, cen.censor_any, path, prog, style)
+            info = ve.ffprobe(r["path"]) or {}
+            name = ve.sanitize_filename(os.path.splitext(getattr(media, "file_name", None) or "video.mp4")[0])
+            cap = (
+                f"🔞 <b>Censored</b>\n🩹 Regions hidden: <code>{r.get('found', 0)}</code>\n"
+                f"🧠 Detector: <code>{'+'.join(r.get('backends') or [])}</code>"
+            )
+            await ve.send_one(
+                client, chat, r["path"], f"{name}_censored.mp4", cap, info, None,
+                prog, "cz", workdir, message.id
+            )
         try:
             await st.delete()
         except Exception:
             pass
+    except ve.Cancelled:
+        await ve.cancel_note(st)
+    except asyncio.CancelledError:
+        await ve.cancel_note(st)
+        raise
     except Exception as e:
+        logging.exception("censor failed")
         try:
-            await st.edit_text(f"❌ Censor fail: <code>{esc(str(e)[:200])}</code>")
+            await st.edit_text(f"❌ Censor fail: <code>{esc(str(e)[:250])}</code>")
         except Exception:
             pass
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-# ============================================================== smart chat
 async def smart_chat(client, message, text):
+    chat = message.chat.id
     ctx = _ctx(message)
     it = await ai_or_rule(text, ctx)
     act = it["action"]
+    hist(chat).append(f"Owner: {text[:300]}")
+    if act == "cancel":
+        return await do_cancel(client, message)
     if act in ("status", "help", "start", "template"):
         if act == "status":
-            m = await safe(message.reply_text, status_text(), quote=True)
-            if getattr(m, "id", None):
-                remember_sent(message.chat.id, m.id)
-            return
+            return await _reply(message, status_text())
         if act == "help":
-            m = await safe(message.reply_text, HELP_TEXT, quote=True)
-            if getattr(m, "id", None):
-                remember_sent(message.chat.id, m.id)
-            return
+            return await _reply(message, HELP_TEXT)
         if act == "start":
-            m = await safe(message.reply_text, START_TEXT, quote=True)
-            if getattr(m, "id", None):
-                remember_sent(message.chat.id, m.id)
-            return
+            return await _reply(message, START_TEXT)
         return await template_reply(message, it["arg"])
-    if act in ("ask", "chat", "none"):
-        reply = it.get("reply") or await ai_free_reply(text, ctx)
-        if not reply:
-            reply = "Samajh nahi aaya — thoda aur batao. Ya /help dekho."
-        m = await safe(message.reply_text, f"🤖 {esc(reply)}", quote=True)
-        if getattr(m, "id", None):
-            remember_sent(message.chat.id, m.id)
-        return
-    # baaki actions engine ke chat handler ko de do
+    if act in ("chat", "none"):
+        reply = it.get("reply") or await ai_free_reply(text, ctx) or local_chat(chat, text)
+        hist(chat).append(f"Bot: {reply[:300]}")
+        return await _reply(message, f"🤖 {esc(reply)}")
     return await chat_message(client, message, text, START_TEXT, HELP_TEXT)
 
 
-# ============================================================== router
 @app.on_message(filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed
                 & ~filters.command(COMMANDS))
 async def router(client, message: Message):
@@ -531,98 +581,102 @@ async def router(client, message: Message):
         return
     try:
         if message.media_group_id:
-            return await album_post(client, message)
-        await intake(client, message)
+            return _enqueue(message.chat.id, ("album", message))
+        if CANCEL_RE.match(text) and not media_of(message)[0] and not extract_urls(message):
+            return await do_cancel(client, message)
+        await intake(message)
     except Exception as e:
         logging.exception("router failed")
         try:
-            m = await message.reply_text(f"❌ <code>{esc(str(e)[:200])}</code>", quote=True)
-            if getattr(m, "id", None):
-                remember_sent(message.chat.id, m.id)
+            await _reply(message, f"❌ <code>{esc(str(e)[:200])}</code>")
         except Exception:
             pass
 
 
-# ============================================================== commands
-async def _cmd_reply(message, text):
-    m = await safe(message.reply_text, text, quote=True)
-    if getattr(m, "id", None):
-        remember_sent(message.chat.id, m.id)
-    return m
+def _cmd(name):
+    return filters.command(name) & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed
 
 
-@app.on_message(filters.command("start") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
+@app.on_message(_cmd("start"))
 async def start_cmd(client, message: Message):
-    await _cmd_reply(message, START_TEXT)
+    await _reply(message, START_TEXT)
 
 
-@app.on_message(filters.command("help") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
+@app.on_message(_cmd("help"))
 async def help_cmd(client, message: Message):
-    await _cmd_reply(message, HELP_TEXT)
+    await _reply(message, HELP_TEXT)
 
 
-@app.on_message(filters.command("queue") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
+@app.on_message(_cmd(["queue", "status"]))
 async def queue_cmd(client, message: Message):
-    await _cmd_reply(message, status_text())
+    chat = message.chat.id
+    q = CHAT_Q.get(chat)
+    await _reply(
+        message,
+        status_text() + f"\n• Tumhare chal rahe kaam: <code>{ve.active_count(chat)}</code>"
+        f"\n• Queue mein: <code>{q.qsize() if q else 0}</code>"
+    )
 
 
-@app.on_message(filters.command("status") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
-async def status_cmd(client, message: Message):
-    await _cmd_reply(message, status_text())
+@app.on_message(_cmd(["cancel", "stop"]))
+async def cancel_cmd(client, message: Message):
+    await do_cancel(client, message)
 
 
-@app.on_message(filters.command("template") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
+@app.on_message(_cmd("template"))
 async def template_cmd(client, message: Message):
     arg = (message.text or "").split(maxsplit=1)
     await template_reply(message, arg[1].strip() if len(arg) > 1 else "")
 
 
-@app.on_message(filters.command("download") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
+@app.on_message(_cmd("download"))
 async def download_cmd(client, message: Message):
     urls = extract_urls(message)
     if not urls and message.reply_to_message:
         urls = extract_urls(message.reply_to_message)
     if not urls:
-        return await _cmd_reply(message, "🔗 Link bhejo ya kisi link-message par reply karke /download karo.")
+        return await _reply(message, "🔗 Link bhejo ya kisi link-message par reply karke /download karo.")
     await download_message(client, message, message.text or "", urls[:10])
 
 
-@app.on_message(filters.command("compress") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
+@app.on_message(_cmd("compress"))
 async def compress_cmd(client, message: Message):
     src = message if is_video_media(message) else message.reply_to_message
     if not (src and is_video_media(src)):
-        return await _cmd_reply(message, "🎬 Video file bhejo (ya video par reply karke /compress).")
+        return await _reply(message, "🎬 Video file bhejo (ya video par reply karke /compress).")
     await compress_message(client, src, src.caption or "")
 
 
-@app.on_message(filters.command("censor") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
+@app.on_message(_cmd("censor"))
 async def censor_cmd(client, message: Message):
+    parts = (message.text or message.caption or "").split()
+    style = next((p.lower() for p in parts[1:] if p.lower() in cen.STYLES), None)
     src = message if media_of(message)[0] else message.reply_to_message
     if not src:
-        return await _cmd_reply(message, "🔞 Image/Video bhejo (ya us par reply karke /censor).")
+        return await _reply(message, "🔞 Image/Video bhejo (ya us par reply karke /censor).")
     kind, _ = media_of(src)
     if kind == "photo":
-        await ve.censor_photo_message(client, src, "blur")
-    elif kind in ("video", "document"):
-        await censor_uploaded_video(client, src, "blur")
+        await ve.censor_photo_message(client, src, style)
+    elif kind in ("video", "document", "animation"):
+        await censor_uploaded_video(client, src, style)
     else:
-        await _cmd_reply(message, "🔞 Sirf image ya video censor kar sakta hoon.")
+        await _reply(message, "🔞 Sirf image ya video censor kar sakta hoon.")
 
 
-@app.on_message(filters.command("post") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
+@app.on_message(_cmd("post"))
 async def post_cmd(client, message: Message):
     urls = extract_urls(message) or (extract_urls(message.reply_to_message) if message.reply_to_message else [])
     if not urls:
-        return await _cmd_reply(message, "🔗 Post ke liye links bhejo (media ke saath ya bina).")
+        return await _reply(message, "🔗 Post ke liye links bhejo (media ke saath ya bina).")
     k, fid = media_of(message)
     await post_message(client, message, urls, k, fid)
 
 
-@app.on_message(filters.command("cut") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
+@app.on_message(_cmd("cut"))
 async def cut_cmd(client, message: Message):
     job = ve.JOBS.get(ve.LAST.get(message.chat.id))
     if not job:
-        return await _cmd_reply(message, "✂️ Cut ke liye pehle koi video ka link bhejo, phir Cut dabao.")
+        return await _reply(message, "✂️ Cut ke liye pehle koi video ka link bhejo, phir Cut dabao.")
     job.cs, job.ce, job.sel, job.fresh = 0.0, job.src.duration or 600.0, "s", True
     m = await safe(message.reply_text, ve.panel_text(job), reply_markup=ve.panel_kb(job), quote=True)
     if getattr(m, "id", None):
@@ -630,24 +684,19 @@ async def cut_cmd(client, message: Message):
     job.msg = m
 
 
-@app.on_message(filters.command("ai") & filters.private & ~filters.me & ~filters.bot & ~filters.outgoing & allowed)
+@app.on_message(_cmd("ai"))
 async def ai_cmd(client, message: Message):
     q = (message.text or "").split(maxsplit=1)
     text = q[1].strip() if len(q) > 1 else ""
     if not text:
-        return await _cmd_reply(message, "🤖 Kuch likho: <code>/ai 720p mein download karo</code>")
+        return await _reply(message, "🤖 Kuch likho: <code>/ai 720p mein download karo</code>")
     await smart_chat(client, message, text)
 
 
-# ============================================================== callbacks
 @app.on_callback_query(allowed)
 async def on_callback(client, cq: CallbackQuery):
     parts = (cq.data or "").split(":")
     act = parts[0]
-    # ask-menu callbacks (batch)
-    if act == "a" and len(parts) >= 3:
-        return await handle_ask(client, cq, parts[1], parts[2])
-    # image censor from a single photo prompt
     if act == "pz" and len(parts) >= 3 and parts[1] == "img":
         await cq.answer("🔞 Censor shuru…")
         try:
@@ -655,13 +704,11 @@ async def on_callback(client, cq: CallbackQuery):
         except Exception:
             msg = None
         if msg and media_of(msg)[0] == "photo":
-            return await ve.censor_photo_message(client, msg, "blur")
+            return await ve.censor_photo_message(client, msg, None)
         return
-    # everything else -> engine (job/cut/fail panels)
     return await handle_callback(client, cq)
 
 
-# ============================================================== main
 async def main():
     global START_TS
     init_engine()
@@ -669,7 +716,21 @@ async def main():
         logging.error("❌ ffmpeg/ffprobe install nahi hai! (apt install ffmpeg)")
     START_TS = time.time()
     await app.start()
-    logging.info("🚀 Modular Bot Started (Batch + Ask Menu + AI Brain + Offline Censor)")
+    try:
+        await app.set_bot_commands([
+            BotCommand("cancel", "Sab chal raha kaam roko"),
+            BotCommand("help", "Kaise use karein"),
+            BotCommand("status", "Queue / status"),
+            BotCommand("censor", "Video/image censor"),
+            BotCommand("compress", "Video compress"),
+            BotCommand("cut", "Video cut"),
+            BotCommand("post", "Post banao"),
+            BotCommand("template", "Template chuno"),
+        ])
+    except Exception:
+        pass
+    asyncio.get_running_loop().run_in_executor(None, cen._load)
+    logging.info("🚀 Modular Bot Started (Per-message queue + AI Brain + Anime/3D Censor + /cancel)")
     spawn(janitor())
     try:
         await idle()
