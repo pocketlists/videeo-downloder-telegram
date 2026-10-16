@@ -3,7 +3,6 @@ name: Run Telegram Video Downloader Bot
 on:
   workflow_dispatch:
 
-# Ye purane chal rahe bot run ko turant cancel karta hai -> double/triple message nahi aayenge
 concurrency:
   group: telegram-bot-${{ github.ref }}
   cancel-in-progress: true
@@ -23,10 +22,10 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install System Dependencies (FFmpeg + OpenCV/ONNX libs)
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg libglib2.0-0 libsm6 libxext6 libgomp1
+          sudo apt-get install -y ffmpeg libglib2.0-0 libsm6 libxext6 libgomp1 libgl1
 
       - name: Install Python Packages
         run: |
@@ -39,8 +38,43 @@ jobs:
           python -m playwright install chromium
           python -m playwright install-deps chromium
 
-      - name: Warm-up Censor Model (offline check)
-        run: python -c "from nudenet import NudeDetector; NudeDetector(); print('NudeNet model ready (bundled 320n.onnx)')"
+      - name: Cache Censor Models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: censor-models-v1
+
+      - name: Warm-up Censor Models
+        run: |
+          python -c "import modules.censor_engine as c; c._load(); print('Censor backends:', c.censor_backends())"
+
+      - name: Fallback Proxy (Cloudflare WARP)
+        continue-on-error: true
+        env:
+          SECRET_PROXY: ${{ secrets.FALLBACK_PROXY }}
+        run: |
+          if [ -n "$SECRET_PROXY" ]; then
+            echo "FALLBACK_PROXY=$SECRET_PROXY" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+          sudo systemctl enable --now warp-svc || true
+          sleep 3
+          warp-cli --accept-tos registration new || warp-cli --accept-tos register
+          warp-cli --accept-tos set-mode proxy || warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+          for i in $(seq 1 20); do
+            if curl -s -m 5 --socks5-hostname 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -q "warp="; then
+              echo "FALLBACK_PROXY=socks5h://127.0.0.1:40000" >> "$GITHUB_ENV"
+              echo "WARP proxy ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
 
       - name: Setup Cookies
         env:
@@ -48,9 +82,9 @@ jobs:
         run: |
           if [ -n "$COOKIES_DATA" ]; then
             echo "$COOKIES_DATA" > cookies.txt
-            echo "✅ cookies.txt created."
+            echo "cookies.txt created."
           else
-            echo "⚠️ No cookies secret, skipping."
+            echo "No cookies secret, skipping."
           fi
 
       - name: Start Modular Telegram Bot
@@ -59,6 +93,9 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          BATCH_WINDOW: '4'
-          ASK_MODE: 'auto'
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          TEXT_WINDOW: '1.8'
+          CENSOR_STYLE: 'mosaic'
+          CENSOR_MAX_SEC: '180'
+          CENSOR_BUDGET_SEC: '360'
         run: python bot.py
