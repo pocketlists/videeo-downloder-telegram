@@ -1,3 +1,4 @@
+# ==================== PART 1 OF 2 ====================
 import os
 import re
 import math
@@ -17,7 +18,6 @@ from functools import lru_cache
 from urllib.parse import urlparse, urljoin, unquote
 
 import yt_dlp
-import requests
 import cloudscraper
 from pyrogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -27,9 +27,14 @@ from playwright.async_api import async_playwright
 
 from modules.post_maker import remember_sent, template_reply, URL_REGEX
 from modules.censor_engine import (
-    censor_image, censor_video, censor_any, censor_backends, video_seconds,
-    CENSOR_MAX_SEC, CENSOR_STYLE,
+    censor_image, censor_any, video_seconds, CENSOR_MAX_SEC,
 )
+
+try:
+    from yt_dlp.utils import DownloadCancelled
+except Exception:
+    class DownloadCancelled(Exception):
+        pass
 
 try:
     import google.generativeai as genai
@@ -72,12 +77,19 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+
 class Cancelled(Exception):
     pass
 
 
-GEMINI_SKIP = ("lite", "image", "tts", "thinking", "exp", "live", "audio", "vision", "embedding", "learnlm", "gemma", "robotics", "computer")
-GEMINI_DEAD = ("404", "not found", "no longer available", "not supported", "deprecated", "no longer supported")
+GEMINI_SKIP = (
+    "lite", "image", "tts", "thinking", "exp", "live", "audio",
+    "vision", "embedding", "learnlm", "gemma", "robotics", "computer"
+)
+GEMINI_DEAD = (
+    "404", "not found", "no longer available", "not supported",
+    "deprecated", "no longer supported"
+)
 
 
 def _ver_key(name):
@@ -112,27 +124,33 @@ def gemini_candidates():
 
 class _AI:
     def __init__(self, names):
-        self.names = names
+        self.names = list(names or [])
         self.i = 0
         self.cache = {}
+        self._lock = threading.Lock()
 
     def generate_content(self, prompt, **kw):
+        if not self.names:
+            raise RuntimeError("No Gemini models configured")
         last = None
         for _ in range(len(self.names)):
-            name = self.names[self.i]
-            try:
+            with self._lock:
+                name = self.names[self.i]
                 m = self.cache.get(name)
                 if m is None:
                     m = self.cache[name] = genai.GenerativeModel(name)
+            try:
                 return m.generate_content(prompt, **kw)
             except Exception as e:
                 last = e
                 if any(k in str(e).lower() for k in GEMINI_DEAD):
                     logging.warning(f"[ai] {name} unavailable, next model")
-                    self.i = (self.i + 1) % len(self.names)
+                    with self._lock:
+                        if self.names[self.i] == name:
+                            self.i = (self.i + 1) % len(self.names)
                     continue
                 raise
-        raise last
+        raise (last or RuntimeError("Gemini generate_content failed"))
 
 
 ai_model = None
@@ -169,13 +187,41 @@ TIME_PAT = r"\d{1,2}(?::\d{1,2}){1,2}"
 RANGE_RE = re.compile(rf"(?<![\d:])({TIME_PAT})\s*(?:-|–|—|to|se)\s*({TIME_PAT})(?![\d:])", re.I)
 
 
+def _is_own_dir(name: str) -> bool:
+    return (
+        name.startswith(INSTANCE)
+        or name.startswith(f"cz_{INSTANCE}")
+        or name.startswith(f"cmp_{INSTANCE}")
+        or name.startswith(f"ci_{INSTANCE}")
+    )
+
+
+def _ensure_sems():
+    global ANALYZE_SEM, DL_SEM, ENC_SEM
+    if ANALYZE_SEM is None:
+        ANALYZE_SEM = asyncio.Semaphore(MAX_CONCURRENT)
+    if DL_SEM is None:
+        DL_SEM = asyncio.Semaphore(MAX_CONCURRENT)
+    if ENC_SEM is None:
+        ENC_SEM = asyncio.Semaphore(1)
+
+
 def init_engine():
     global ANALYZE_SEM, DL_SEM, ENC_SEM
     ANALYZE_SEM = asyncio.Semaphore(MAX_CONCURRENT)
     DL_SEM = asyncio.Semaphore(MAX_CONCURRENT)
     ENC_SEM = asyncio.Semaphore(1)
+    now = time.time()
     for d in os.listdir(DOWNLOAD_DIR):
-        shutil.rmtree(os.path.join(DOWNLOAD_DIR, d), ignore_errors=True)
+        p = os.path.join(DOWNLOAD_DIR, d)
+        if not os.path.isdir(p):
+            continue
+        try:
+            age = now - os.path.getmtime(p)
+        except OSError:
+            age = 0
+        if _is_own_dir(d) or age > 24 * 3600:
+            shutil.rmtree(p, ignore_errors=True)
 
 
 def spawn(coro, chat=None):
@@ -184,7 +230,15 @@ def spawn(coro, chat=None):
     t.add_done_callback(BG_TASKS.discard)
     if chat is not None:
         CHAT_TASKS.setdefault(chat, set()).add(t)
-        t.add_done_callback(lambda x, c=chat: CHAT_TASKS.get(c, set()).discard(x))
+
+        def _cleanup(x, c=chat):
+            s = CHAT_TASKS.get(c)
+            if s is not None:
+                s.discard(x)
+                if not s:
+                    CHAT_TASKS.pop(c, None)
+
+        t.add_done_callback(_cleanup)
     return t
 
 
@@ -477,7 +531,7 @@ def make_session(headers: dict, cookies: list):
 @lru_cache(maxsize=8)
 def impersonate_target(name="chrome"):
     try:
-        import curl_cffi
+        import curl_cffi  # noqa: F401
         from yt_dlp.networking.impersonate import ImpersonateTarget
         return ImpersonateTarget.from_str(name)
     except Exception:
@@ -621,7 +675,7 @@ def ffprobe(target, headers=None, timeout=40):
     }
 
 
-def run_ffmpeg(args, duration=0.0, on_progress=None):
+def run_ffmpeg(args, duration=0.0, on_progress=None, stop=None):
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
            "-progress", "pipe:1", "-nostats"] + [str(a) for a in args]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -630,10 +684,14 @@ def run_ffmpeg(args, duration=0.0, on_progress=None):
     t.start()
     try:
         for line in p.stdout:
-            if on_progress and duration and line.startswith(("out_time_us=", "out_time_ms=")):
+            if stop is not None and stop.is_set():
+                p.kill()
+                p.wait()
+                raise Cancelled()
+            if on_progress and line.startswith(("out_time_us=", "out_time_ms=")):
                 try:
                     cur = int(line.split("=", 1)[1]) / 1_000_000
-                    on_progress(min(max(cur, 0), duration), duration)
+                    on_progress(min(max(cur, 0), duration or cur), duration or 0.0)
                 except Cancelled:
                     p.kill()
                     p.wait()
@@ -647,20 +705,35 @@ def run_ffmpeg(args, duration=0.0, on_progress=None):
         raise RuntimeError(f"ffmpeg fail: {(err[0] if err else '')[-400:]}")
 
 
-def keyframe_times(path):
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-         "packet=pts_time,flags", "-of", "csv=p=0", path],
-        capture_output=True, text=True, timeout=900,
-    )
+def keyframe_times(path, stop=None):
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", str(path)
+    ]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     out = []
-    for line in r.stdout.splitlines():
-        parts = line.strip().split(",")
-        if len(parts) >= 2 and "K" in parts[1]:
-            try:
-                out.append(float(parts[0]))
-            except ValueError:
-                pass
+    t0 = time.time()
+    try:
+        for line in p.stdout:
+            if stop is not None and stop.is_set():
+                p.kill()
+                p.wait()
+                raise Cancelled()
+            if time.time() - t0 > 900:
+                p.kill()
+                p.wait()
+                break
+            parts = line.strip().split(",")
+            if len(parts) >= 2 and "K" in parts[1]:
+                try:
+                    out.append(float(parts[0]))
+                except ValueError:
+                    pass
+        p.wait(timeout=10)
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
     return sorted(out)
 
 
@@ -681,6 +754,11 @@ def _rm(p):
         os.remove(p)
     except OSError:
         pass
+
+
+def _clear_files(workdir):
+    for f in os.listdir(workdir):
+        _rm(os.path.join(workdir, f))
 
 
 def ensure_compatible(path, target_h=0, on_progress=None):
@@ -725,7 +803,7 @@ def _venc(info, crf):
     return o
 
 
-def _assemble(parts, src, dst, a_ss, a_dur, has_a, dur):
+def _assemble(parts, src, dst, a_ss, a_dur, has_a, dur, stop=None):
     lst = dst + ".list.txt"
     with open(lst, "w") as f:
         for p in parts:
@@ -736,7 +814,7 @@ def _assemble(parts, src, dst, a_ss, a_dur, has_a, dur):
     args += ["-map", "0:v:0"] + (["-map", "1:a:0"] if has_a else [])
     args += ["-c", "copy", "-t", f"{dur:.3f}", "-movflags", "+faststart", dst]
     try:
-        run_ffmpeg(args, dur)
+        run_ffmpeg(args, dur, stop=stop)
     finally:
         for p in parts + [lst]:
             _rm(p)
@@ -746,36 +824,45 @@ def smart_cut(src, dst, start, end, info, cb=None):
     dur = end - start
     has_a = bool(info["acodec"])
     enc = _venc(info, 18)
+    stop = getattr(cb, "stop", None)
     prog = (lambda c, t: cb.update("✂️ Cutting", c, t, "time")) if cb else None
-    kfs = keyframe_times(src) if info["vcodec"] == "h264" and dur > 40 else []
+    kfs = keyframe_times(src, stop=stop) if info["vcodec"] == "h264" and dur > 40 else []
     k1 = next((k for k in kfs if k >= start), None)
     k2 = max((k for k in kfs if k <= end), default=None)
     if k1 is None or k2 is None or k2 - k1 < 6:
-        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}", "-map", "0:v:0", "-map", "0:a:0?"] + enc +
-                   (["-c:a", "copy"] if has_a else ["-an"]) + ["-movflags", "+faststart", dst], dur, prog)
+        run_ffmpeg(
+            ["-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}", "-map", "0:v:0", "-map", "0:a:0?"] + enc +
+            (["-c:a", "copy"] if has_a else ["-an"]) + ["-movflags", "+faststart", dst],
+            dur, prog, stop=stop
+        )
         return
     work = os.path.dirname(dst) or "."
     a, b, c = (os.path.join(work, n) for n in ("cut_a.ts", "cut_b.ts", "cut_c.ts"))
     vmap = ["-map", "0:v:0", "-an"]
     parts = []
     if k1 - start > 0.05:
-        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{k1 - start:.3f}"] + vmap + enc + ["-f", "mpegts", a])
+        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{k1 - start:.3f}"] + vmap + enc + ["-f", "mpegts", a], stop=stop)
         parts.append(a)
-    run_ffmpeg(["-ss", f"{k1 + 0.005:.3f}", "-i", src, "-t", f"{k2 - k1:.3f}"] + vmap +
-               ["-c:v", "copy", "-f", "mpegts", b], k2 - k1, prog)
+    run_ffmpeg(
+        ["-ss", f"{k1 + 0.005:.3f}", "-i", src, "-t", f"{k2 - k1:.3f}"] + vmap +
+        ["-c:v", "copy", "-f", "mpegts", b], k2 - k1, prog, stop=stop
+    )
     parts.append(b)
     if end - k2 > 0.05:
-        run_ffmpeg(["-ss", f"{k2:.3f}", "-i", src, "-t", f"{end - k2:.3f}"] + vmap + enc + ["-f", "mpegts", c])
+        run_ffmpeg(["-ss", f"{k2:.3f}", "-i", src, "-t", f"{end - k2:.3f}"] + vmap + enc + ["-f", "mpegts", c], stop=stop)
         parts.append(c)
-    _assemble(parts, src, dst, start, dur, has_a, dur)
+    _assemble(parts, src, dst, start, dur, has_a, dur, stop=stop)
 
 
 def cut_video(src, dst, start, end, mode, info, cb=None):
     dur = max(0.5, end - start)
+    stop = getattr(cb, "stop", None)
     if mode == "fast":
-        run_ffmpeg(["-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}", "-map", "0:v:0", "-map", "0:a:0?",
-                    "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", dst],
-                   dur, (lambda c, t: cb.update("✂️ Cutting", c, t, "time")) if cb else None)
+        run_ffmpeg(
+            ["-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}", "-map", "0:v:0", "-map", "0:a:0?",
+             "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", dst],
+            dur, (lambda c, t: cb.update("✂️ Cutting", c, t, "time")) if cb else None, stop=stop
+        )
         out = ffprobe(dst)
         if out and out["duration"] >= dur * 0.5:
             return "fast"
@@ -792,12 +879,16 @@ def compress_to_fit(src, dst, target, on_progress=None):
     a = 128_000 if has_a else 0
     v = max(int(target * 8 * 0.96 / D - a), 200_000)
     scale = ["-vf", "scale=-2:720"] if (info["short"] > 720 and v < 1_800_000) else []
+    stop = getattr(on_progress, "stop", None)
     for _ in range(3):
         args = ["-i", src, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast",
                 "-b:v", str(v), "-maxrate", str(int(v * 1.3)), "-bufsize", str(v * 2), "-pix_fmt", "yuv420p"] + scale
         args += (["-c:a", "aac", "-b:a", "128k"] if has_a else ["-an"])
-        run_ffmpeg(args + ["-movflags", "+faststart", dst], D,
-                   (lambda c, t: on_progress.update("🗜 Compressing", c, t, "time")) if on_progress else None)
+        run_ffmpeg(
+            args + ["-movflags", "+faststart", dst], D,
+            (lambda c, t: on_progress.update("🗜 Compressing", c, t, "time")) if on_progress else None,
+            stop=stop
+        )
         size = os.path.getsize(dst)
         if size <= target:
             return "full"
@@ -810,8 +901,10 @@ def extract_audio(path, out, title, cb=None):
     if not info or not info["acodec"]:
         raise RuntimeError("Is video mein audio nahi hai")
     a = ["-c:a", "copy"] if info["acodec"] == "aac" else ["-c:a", "aac", "-b:a", "192k"]
-    run_ffmpeg(["-i", path, "-vn", "-map", "0:a:0"] + a +
-               ["-metadata", f"title={title}", "-movflags", "+faststart", out], info["duration"], cb)
+    run_ffmpeg(
+        ["-i", path, "-vn", "-map", "0:a:0"] + a +
+        ["-metadata", f"title={title}", "-movflags", "+faststart", out], info["duration"], cb
+    )
     return out, ffprobe(out) or info
 
 
@@ -841,13 +934,17 @@ def pick_preset(duration, pixels_per_sec, codec):
     return "slow" if work <= 150 else "medium" if work <= 700 else "fast" if work <= 2400 else "veryfast"
 
 
-def detect_animation(path, duration):
+def detect_animation(path, duration, stop=None):
     counts = []
     for f in (0.15, 0.35, 0.55, 0.75, 0.9):
+        if stop is not None and stop.is_set():
+            raise Cancelled()
         try:
-            r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{duration * f:.2f}", "-i", path, "-frames:v", "1",
-                                "-vf", "scale=64:36:flags=area", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
-                               capture_output=True, timeout=60)
+            r = subprocess.run(
+                ["ffmpeg", "-v", "error", "-ss", f"{duration * f:.2f}", "-i", path, "-frames:v", "1",
+                 "-vf", "scale=64:36:flags=area", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+                capture_output=True, timeout=60
+            )
         except Exception:
             continue
         b = r.stdout
@@ -884,16 +981,21 @@ def _sample_pts(duration, n=3, length=5.0):
     return [(max(0.0, duration * (i + 1) / (n + 1) - length / 2), length) for i in range(n)]
 
 
-def _ssim(src, t, length, sample, vf):
+def _ssim(src, t, length, sample, vf, stop=None):
+    if stop is not None and stop.is_set():
+        raise Cancelled()
     ref = f"[0:v]{vf + ',' if vf else ''}setpts=PTS-STARTPTS[a]"
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-ss", f"{t:.2f}", "-t", f"{length:.2f}", "-i", src,
-                        "-i", sample, "-lavfi", f"{ref};[1:v]setpts=PTS-STARTPTS[b];[a][b]ssim", "-f", "null", "-"],
-                       capture_output=True, text=True, timeout=900)
+    r = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-ss", f"{t:.2f}", "-t", f"{length:.2f}", "-i", src,
+         "-i", sample, "-lavfi", f"{ref};[1:v]setpts=PTS-STARTPTS[b];[a][b]ssim", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=900
+    )
     m = re.search(r"All:([0-9.]+)", r.stderr)
     return float(m.group(1)) if m else 0.0
 
 
 def smart_compress(src, dst, prog, opts):
+    prog.check()
     info = ffprobe(src)
     if not info or not info["vcodec"] or info["duration"] <= 0:
         raise RuntimeError("Is file mein video nahi mili")
@@ -904,7 +1006,7 @@ def smart_compress(src, dst, prog, opts):
     W, H = info["width"], info["height"]
     mh = opts.get("max_h", 0)
     vb = info["v_bps"] or max(int(S * 8 / D) - (info["a_bps"] or 0), 1)
-    if not tune and detect_animation(src, D):
+    if not tune and detect_animation(src, D, stop=prog.stop):
         tune = "animation"
     preset = pick_preset(D, W * H * (info["fps"] or 30), codec)
     sample_preset = "fast" if preset in ("slow", "medium") else preset
@@ -925,11 +1027,15 @@ def smart_compress(src, dst, prog, opts):
         args = _venc_args(codec, crf, sample_preset, tune, cap, pix) + vf_args
         size, secs, vals = 0, 0.0, []
         for k, (t, length) in enumerate(pts):
+            prog.check()
             sp = os.path.join(work, f"smp_{k}.mp4")
-            run_ffmpeg(["-ss", f"{t:.2f}", "-i", src, "-t", f"{length:.2f}", "-map", "0:v:0", "-an"] + args + [sp])
+            run_ffmpeg(
+                ["-ss", f"{t:.2f}", "-i", src, "-t", f"{length:.2f}", "-map", "0:v:0", "-an"] + args + [sp],
+                length, lambda c, tot: prog.check(), stop=prog.stop
+            )
             size += os.path.getsize(sp)
             secs += length
-            vals.append(_ssim(src, t, length, sp, vf))
+            vals.append(_ssim(src, t, length, sp, vf, stop=prog.stop))
             _rm(sp)
             state["done"] += 1
             prog.update("🔬 Smart Quality Analysis (SSIM Lock)", min(state["done"], steps), steps, "steps")
@@ -955,7 +1061,7 @@ def smart_compress(src, dst, prog, opts):
 
     args = (["-i", src, "-map", "0:v:0", "-map", "0:a:0?"] + _venc_args(codec, crf, preset, tune, cap, pix) + vf_args +
             _audio_args(info) + ["-movflags", "+faststart", dst])
-    run_ffmpeg(args, D, lambda c, t: prog.update("🗜 Smart Compressing", c, t, "time"))
+    run_ffmpeg(args, D, lambda c, t: prog.update("🗜 Smart Compressing", c, t, "time"), stop=prog.stop)
     after = os.path.getsize(dst)
     if after >= S * 0.98:
         _rm(dst)
@@ -1103,6 +1209,8 @@ def ydl_call(opts, fn, url=None):
 
     try:
         return run()
+    except (Cancelled, DownloadCancelled):
+        raise
     except Exception as e:
         if "impersonat" in str(e).lower() and "impersonate" in opts:
             NO_IMP = True
@@ -1122,7 +1230,7 @@ def ytdlp_extract(url, headers=None):
         except Exception as e:
             last = e
             if not any(k in str(e).lower() for k in BLOCK_HINTS):
-                continue
+                break
             continue
         if info and info.get("_type") == "playlist":
             entries = [e for e in (info.get("entries") or []) if e]
@@ -1254,8 +1362,7 @@ async def source_from_media(media_url, page_url, cookies, title=None, thumbs=Non
     else:
         s.quals = build_quals(s.formats, s.duration, s.height, s.size)
     return s
-
-
+# ==================== PART 2 OF 2 ====================
 def scan_html_for_media(text, base):
     text = html.unescape((text or "").replace("\\/", "/").replace("\\u0026", "&"))
     found = []
@@ -1714,14 +1821,17 @@ async def resolve_source(url, status):
     raise ResolveError(err or "Video extract nahi ho paaya", diag)
 
 
-def _largest_media_file(workdir):
+def _largest_media_file(workdir, since=0.0):
     best, size = None, 0
     for f in os.listdir(workdir):
         p = os.path.join(workdir, f)
         if f.endswith((".part", ".ytdl", ".txt", ".ts", ".jpg")) or not os.path.isfile(p):
             continue
-        if os.path.getsize(p) > size:
-            best, size = p, os.path.getsize(p)
+        if since and os.path.getmtime(p) + 0.5 < since:
+            continue
+        sz = os.path.getsize(p)
+        if sz > size:
+            best, size = p, sz
     if not best or size < 50 * 1024:
         raise RuntimeError("Download ke baad valid video file nahi mili")
     return best
@@ -1729,11 +1839,15 @@ def _largest_media_file(workdir):
 
 def ytdlp_download(url, workdir, headers, max_h, prog, audio=False, imp="chrome"):
     def hook(d):
-        if d.get("status") == "downloading":
-            prog.update(
-                "⬇️ Downloading", d.get("downloaded_bytes") or 0,
-                d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            )
+        try:
+            prog.check()
+            if d.get("status") == "downloading":
+                prog.update(
+                    "⬇️ Downloading", d.get("downloaded_bytes") or 0,
+                    d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                )
+        except Cancelled:
+            raise DownloadCancelled("User cancelled")
 
     sort = [f"res:{max_h}", "vcodec:h264", "acodec:aac", "ext:mp4:m4a", "proto"]
     if audio:
@@ -1744,6 +1858,9 @@ def ytdlp_download(url, workdir, headers, max_h, prog, audio=False, imp="chrome"
 
     last = None
     for (fmt, srt), name in [(p, n) for n in dict.fromkeys([imp, "chrome", ""]) for p in plans]:
+        prog.check()
+        _clear_files(workdir)
+        t_attempt = time.time()
         opts = base_ydl_opts(headers, False, name)
         opts.update({
             "outtmpl": os.path.join(workdir, "dl.%(ext)s"),
@@ -1757,11 +1874,13 @@ def ytdlp_download(url, workdir, headers, max_h, prog, audio=False, imp="chrome"
             opts["format_sort"] = srt
         try:
             ydl_call(opts, lambda y: y.extract_info(url, download=True), url)
-            return _largest_media_file(workdir)
+            return _largest_media_file(workdir, since=t_attempt)
+        except (Cancelled, DownloadCancelled):
+            _clear_files(workdir)
+            raise Cancelled()
         except Exception as e:
             last = e
-            for f in os.listdir(workdir):
-                _rm(os.path.join(workdir, f))
+            _clear_files(workdir)
     raise last
 
 
@@ -1778,12 +1897,14 @@ def ffmpeg_stream_download(url, out, headers, duration, prog, hls=False):
         args += ["-bsf:a", "aac_adtstoasc"]
     run_ffmpeg(
         args + ["-movflags", "+faststart", out], duration,
-        lambda c, t: prog.update("⬇️ Downloading (Stream)", c, t, "time")
+        lambda c, t: prog.update("⬇️ Downloading (Stream)", c, t, "time"),
+        stop=prog.stop
     )
     return out
 
 
 def download_direct(url, out_path, headers, cookies, prog, workers=8):
+    prog.check()
     s = make_session(headers, cookies)
     label = "⬇️ Downloading"
 
@@ -1793,6 +1914,8 @@ def download_direct(url, out_path, headers, cookies, prog, workers=8):
             if r.status_code >= 400:
                 raise IOError(f"HTTP {r.status_code}")
             return r
+        except Cancelled:
+            raise
         except Exception:
             return s.get(url, stream=True, timeout=(15, 60), allow_redirects=True)
 
@@ -1811,43 +1934,57 @@ def download_direct(url, out_path, headers, cookies, prog, workers=8):
     if ranged and total > 32 * MiB:
         r.close()
         try:
-            _parallel_download(s, final, out_path, total, workers, lambda d, t: prog.update(label, d, t))
+            _parallel_download(s, final, out_path, total, workers, lambda d, t: prog.update(label, d, t), stop=prog.stop)
             return out_path
+        except Cancelled:
+            _rm(out_path)
+            raise
         except Exception:
+            _rm(out_path)
             r = s.get(url, stream=True, timeout=(15, 60), allow_redirects=True)
             r.raise_for_status()
 
     done = 0
-    with open(out_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-                done += len(chunk)
-                prog.update(label, done, total)
+    try:
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                prog.check()
+                if chunk:
+                    f.write(chunk)
+                    done += len(chunk)
+                    prog.update(label, done, total)
+    except Cancelled:
+        _rm(out_path)
+        raise
     if done < 100 * 1024:
         _rm(out_path)
         raise RuntimeError(f"File sirf {humanbytes(done)} hai — video nahi lagti")
     return out_path
 
 
-def _parallel_download(session, url, out_path, total, workers, cb):
+def _parallel_download(session, url, out_path, total, workers, cb, stop=None):
     chunk = max(8 * MiB, total // (workers * 4))
     ranges = [(i, min(i + chunk - 1, total - 1)) for i in range(0, total, chunk)]
     with open(out_path, "wb") as f:
         f.truncate(total)
     lock, done = threading.Lock(), [0]
+    abort = threading.Event()
 
     def fetch(a, b):
         last = None
         for attempt in range(4):
+            if abort.is_set() or (stop is not None and stop.is_set()):
+                raise Cancelled()
+            got = 0
             try:
                 resp = session.get(url, headers={"Range": f"bytes={a}-{b}"}, stream=True, timeout=(15, 60))
                 if resp.status_code != 206:
                     raise IOError(f"range unsupported ({resp.status_code})")
-                got = 0
                 with open(out_path, "r+b") as fh:
                     fh.seek(a)
                     for data in resp.iter_content(1024 * 1024):
+                        if abort.is_set() or (stop is not None and stop.is_set()):
+                            raise Cancelled()
                         if data:
                             fh.write(data)
                             got += len(data)
@@ -1857,13 +1994,23 @@ def _parallel_download(session, url, out_path, total, workers, cb):
                 if got != b - a + 1:
                     raise IOError("short chunk")
                 return
+            except Cancelled:
+                abort.set()
+                raise
             except Exception as e:
+                if got:
+                    with lock:
+                        done[0] = max(0, done[0] - got)
                 last = e
-                time.sleep(1 + attempt)
+                for _ in range((1 + attempt) * 10):
+                    if abort.is_set() or (stop is not None and stop.is_set()):
+                        raise Cancelled()
+                    time.sleep(0.1)
         raise last
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for fut in [ex.submit(fetch, a, b) for a, b in ranges]:
+        futs = [ex.submit(fetch, a, b) for a, b in ranges]
+        for fut in futs:
             fut.result()
 
 
@@ -1877,6 +2024,17 @@ def choose_tier(src: Source, q: int = 0) -> int:
     return MAX_HEIGHT
 
 
+def _pick_alt(alt_urls: dict, tier: int, default_url: str) -> str:
+    if not alt_urls:
+        return default_url
+    if tier in alt_urls:
+        return alt_urls[tier]
+    lower = [k for k in alt_urls if k <= tier]
+    if lower:
+        return alt_urls[max(lower)]
+    return alt_urls[min(alt_urls)]
+
+
 def download_media(src: Source, workdir, prog, q=0, audio=False):
     try:
         return _download_media(src, workdir, prog, q, audio)
@@ -1886,8 +2044,7 @@ def download_media(src: Source, workdir, prog, q=0, audio=False):
         if not FALLBACK_PROXY or PROXY_URL or not NETERR_RE.search(str(e)):
             raise
         logging.warning("[dl] direct failed, retrying via fallback proxy")
-        for f in os.listdir(workdir):
-            _rm(os.path.join(workdir, f))
+        _clear_files(workdir)
         _tl.proxy = FALLBACK_PROXY
         try:
             return _download_media(src, workdir, prog, q, audio)
@@ -1902,29 +2059,41 @@ def download_media(src: Source, workdir, prog, q=0, audio=False):
 def _download_media(src: Source, workdir, prog, q=0, audio=False):
     tier = choose_tier(src, q)
     errs = []
-    target_url = src.alt_urls.get(tier, src.dl_url) if not audio else src.dl_url
+    target_url = _pick_alt(src.alt_urls, tier, src.dl_url) if not audio else src.dl_url
 
     if src.mode == "ytdlp" and target_url == src.dl_url:
         try:
+            _clear_files(workdir)
             return ytdlp_download(target_url, workdir, src.headers, tier, prog, audio, src.imp)
+        except Cancelled:
+            raise
         except Exception as e:
             errs.append(f"yt-dlp: {str(e)[:150]}")
     else:
         try:
+            _clear_files(workdir)
             return download_direct(target_url, os.path.join(workdir, "dl.mp4"), src.headers, src.cookies, prog)
+        except Cancelled:
+            raise
         except Exception as e:
             errs.append(f"direct: {str(e)[:150]}")
         try:
+            _clear_files(workdir)
             return ytdlp_download(target_url, workdir, src.headers, tier, prog, audio, src.imp)
+        except Cancelled:
+            raise
         except Exception as e:
             errs.append(f"yt-dlp: {str(e)[:150]}")
     kind = classify_media(target_url)
     if kind:
         try:
+            _clear_files(workdir)
             return ffmpeg_stream_download(
                 target_url, os.path.join(workdir, "stream.mp4"),
                 src.headers, src.duration, prog, kind == "hls"
             )
+        except Cancelled:
+            raise
         except Exception as e:
             errs.append(f"ffmpeg: {str(e)[:150]}")
     raise RuntimeError(" | ".join(errs) or "download fail")
@@ -1935,13 +2104,27 @@ def _pixels(path):
     return (inf["width"] * inf["height"]) if inf else 0
 
 
+def _direct_frame_url(s: Source) -> str:
+    if s.mode == "direct" or classify_media(s.dl_url):
+        return s.dl_url
+    if s.alt_urls:
+        return s.alt_urls[max(s.alt_urls)]
+    vids = [
+        f for f in (s.formats or [])
+        if (f.get("url") or "").startswith("http") and f.get("vcodec") not in (None, "none")
+    ]
+    if vids:
+        best = max(vids, key=lambda f: (qheight(f) <= 1080, qheight(f), f.get("tbr") or 0))
+        return best["url"]
+    return ""
+
+
 def fetch_thumbnail(job: Job):
     if job.thumb_path and os.path.exists(job.thumb_path):
         return job.thumb_path
     s = job.src
     sess = make_session(make_headers(s.page_url), s.cookies)
     best, bscore = None, -1.0
-    # 1) Site ke diye gaye thumbnails — resolution + brightness + detail se best chuno
     for i, u in enumerate(s.thumbs[:10]):
         try:
             r = sess.get(u, timeout=20, headers={"Accept": "image/*,*/*"})
@@ -1961,13 +2144,13 @@ def fetch_thumbnail(job: Job):
                 _rm(raw)
         except Exception:
             continue
-    # 2) Web thumb chhoti/blank ho to video ke kai frames se best frame nikalo
-    if bscore < 900_000.0:
+    frame_url = _direct_frame_url(s)
+    if bscore < 900_000.0 and frame_url:
         dur = s.duration or 30
         for k, frac in enumerate((0.08, 0.25, 0.5, 0.75)):
             cand = os.path.join(THUMB_DIR, f"{job.id}_fr{k}.jpg")
             try:
-                grab_frame(s.dl_url, cand, at=max(1.0, dur * frac), headers=dict(s.headers))
+                grab_frame(frame_url, cand, at=max(1.0, dur * frac), headers=dict(s.headers))
             except Exception:
                 continue
             if not os.path.exists(cand):
@@ -1984,7 +2167,6 @@ def fetch_thumbnail(job: Job):
     return best
 
 
-
 def post_kb(job: Job) -> InlineKeyboardMarkup:
     """Har bheji gayi video ke saath — Cut / Censor / Thumbnail (sirf jab user khud dabaye)."""
     return InlineKeyboardMarkup([[
@@ -1996,6 +2178,7 @@ def post_kb(job: Job) -> InlineKeyboardMarkup:
 
 async def run_censor(client, job: Job, mode=None):
     global active_downloads
+    _ensure_sems()
     loop = asyncio.get_running_loop()
     job.busy = True
     msg = job.msg
@@ -2067,7 +2250,7 @@ async def censor_photo_message(client, message: Message, mode=None):
     st = await message.reply_text("🔞 Image censor ho rahi hai…", quote=True)
     if getattr(st, "id", None):
         remember_sent(message.chat.id, st.id)
-    workdir = os.path.join(DOWNLOAD_DIR, f"ci_{int(time.time())}")
+    workdir = os.path.join(DOWNLOAD_DIR, f"ci_{INSTANCE}_{int(time.time())}")
     os.makedirs(workdir, exist_ok=True)
     try:
         path = await client.download_media(media, file_name=os.path.join(workdir, "in.jpg"))
@@ -2289,6 +2472,7 @@ async def _up_progress(current, total, prog, label):
 
 async def run_delivery(client, job: Job, cut, audio=False, compress=None):
     global active_downloads
+    _ensure_sems()
     loop = asyncio.get_running_loop()
     job.busy = True
     msg = job.msg
@@ -2470,6 +2654,7 @@ async def retry_failed(client, msg, f, act, arg):
 
 async def analyze_url(client, status_msg: Message, chat_id: int, url: str, reply_to=None, intent=None):
     global analyzing
+    _ensure_sems()
     intent = intent or Intent()
     short = esc(url[:60])
 
@@ -2566,6 +2751,7 @@ async def chat_message(client, message: Message, text: str, start_text: str, hel
 
 
 async def compress_run(client, c):
+    _ensure_sems()
     loop = asyncio.get_running_loop()
     c["busy"] = True
     st = c["st"]
@@ -2581,6 +2767,8 @@ async def compress_run(client, c):
                 c["fid"], file_name=os.path.join(workdir, f"in{c['ext']}"),
                 progress=_up_progress, progress_args=(prog, "⬇️ Downloading Video")
             )
+            if not path or not os.path.exists(path):
+                raise Cancelled()
             r = await loop.run_in_executor(
                 None, smart_compress, path, os.path.join(workdir, "out.mp4"), prog, dict(c["opts"])
             )
@@ -2612,7 +2800,17 @@ async def compress_run(client, c):
 
 
 async def compress_message(client, message: Message, text: str):
-    media = message.video or message.document
+    media = (
+        message.video
+        or message.document
+        or getattr(message, "animation", None)
+        or getattr(message, "video_note", None)
+    )
+    if not media:
+        m = await message.reply_text("📹 Compress karne ke liye video file ke saath likho.", quote=True)
+        if getattr(m, "id", None):
+            remember_sent(message.chat.id, m.id)
+        return
     fname = getattr(media, "file_name", None) or "video.mp4"
     c = {
         "id": INSTANCE + secrets.token_hex(3),
@@ -2770,5 +2968,11 @@ async def janitor():
                 CJOBS.pop(cid, None)
         for d in os.listdir(DOWNLOAD_DIR):
             p = os.path.join(DOWNLOAD_DIR, d)
-            if os.path.isdir(p) and now - os.path.getmtime(p) > 4 * 3600:
+            if not os.path.isdir(p):
+                continue
+            try:
+                age = now - os.path.getmtime(p)
+            except OSError:
+                continue
+            if (_is_own_dir(d) and age > 4 * 3600) or age > 24 * 3600:
                 shutil.rmtree(p, ignore_errors=True)
