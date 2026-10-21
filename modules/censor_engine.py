@@ -1,7 +1,8 @@
 import os
-import bisect
+import glob
 import math
 import time
+import bisect
 import logging
 import threading
 import subprocess
@@ -9,16 +10,16 @@ import subprocess
 import cv2
 import numpy as np
 
-CENSOR_STYLE = os.environ.get("CENSOR_STYLE", "mosaic").lower()
+CENSOR_STYLE = os.environ.get("CENSOR_STYLE", "sticker").lower()
 CENSOR_DETECTORS = [x.strip() for x in os.environ.get("CENSOR_DETECTORS", "anime,nudenet").lower().split(",") if x.strip()]
 CENSOR_STRICT = int(os.environ.get("CENSOR_STRICT", "2"))
 CENSOR_NUDENET_SCORE = float(os.environ.get("CENSOR_MIN_SCORE", "0.18"))
-CENSOR_COVERED_SCORE = float(os.environ.get("CENSOR_COVERED_SCORE", "0.45"))
+CENSOR_COVERED_SCORE = float(os.environ.get("CENSOR_COVERED_SCORE", "0.35"))
 CENSOR_ANIME_SCORE = float(os.environ.get("CENSOR_ANIME_SCORE", "0.15"))
 CENSOR_ANIME_LEVEL = os.environ.get("CENSOR_ANIME_LEVEL", "s")
 CENSOR_TTA = os.environ.get("CENSOR_TTA", "1") == "1"
-CENSOR_PAD = float(os.environ.get("CENSOR_PAD", "0.4"))
-CENSOR_MIN_FRAC = float(os.environ.get("CENSOR_MIN_FRAC", "0.08"))
+CENSOR_PAD = float(os.environ.get("CENSOR_PAD", "0.10"))
+CENSOR_MIN_FRAC = float(os.environ.get("CENSOR_MIN_FRAC", "0.025"))
 CENSOR_CELLS = int(os.environ.get("CENSOR_CELLS", "4"))
 CENSOR_BUDGET_SEC = float(os.environ.get("CENSOR_BUDGET_SEC", "360"))
 CENSOR_MAX_SCAN_GAP = float(os.environ.get("CENSOR_MAX_SCAN_GAP", "0.2"))
@@ -27,7 +28,7 @@ CENSOR_MAX_SEC = float(os.environ.get("CENSOR_MAX_SEC", "180"))
 CENSOR_CRF = int(os.environ.get("CENSOR_CRF", "18"))
 CENSOR_PRESET = os.environ.get("CENSOR_PRESET", "medium")
 
-STYLES = ("mosaic", "blur", "black", "blend")
+STYLES = ("sticker", "emoji", "mosaic", "blur", "black", "blend")
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff")
 
 NUDENET_EXPOSED = {
@@ -38,12 +39,26 @@ NUDENET_EXPOSED = {
 }
 NUDENET_COVERED = {
     "FEMALE_GENITALIA_COVERED", "BUTTOCKS_COVERED", "FEMALE_BREAST_COVERED", "ANUS_COVERED",
-    "COVERED_GENITALIA_F", "COVERED_BUTTOCKS", "COVERED_BREAST_F", "COVERED_ANUS",
+    "MALE_GENITALIA_COVERED", "MALE_BREAST_COVERED",
+    "COVERED_GENITALIA_F", "COVERED_GENITALIA_M", "COVERED_BUTTOCKS",
+    "COVERED_BREAST_F", "COVERED_BREAST_M", "COVERED_ANUS",
 }
 NUDENET_LABELS = NUDENET_EXPOSED | (NUDENET_COVERED if CENSOR_STRICT >= 2 else set())
 
+STICKER_EMOJI = [
+    ("BREAST", "🙈"),
+    ("GENITALIA", "😂"),
+    ("BUTTOCK", "🫣"),
+    ("ANUS", "🫣"),
+    ("BELLY", "😜"),
+]
+DEFAULT_EMOJI = "🔞"
+
 _lock = threading.Lock()
 _state = {"ready": False, "anime": None, "nude": None}
+_sticker_cache = {}
+_emoji_font = None
+_emoji_font_tried = False
 
 
 def _blank():
@@ -92,8 +107,123 @@ def _require_backends():
 
 
 def _style(s):
-    s = (s or CENSOR_STYLE or "mosaic").lower()
-    return s if s in STYLES else "mosaic"
+    s = (s or CENSOR_STYLE or "sticker").lower()
+    if s == "emoji":
+        s = "sticker"
+    return s if s in STYLES else "sticker"
+
+
+def _emoji_for(label):
+    up = (label or "").upper()
+    for key, em in STICKER_EMOJI:
+        if key in up:
+            return em
+    return DEFAULT_EMOJI
+
+
+def _find_emoji_font():
+    global _emoji_font, _emoji_font_tried
+    if _emoji_font_tried:
+        return _emoji_font
+    _emoji_font_tried = True
+    pats = [
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/truetype/noto-color-emoji/NotoColorEmoji.ttf",
+        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+        "/System/Library/Fonts/Apple Color Emoji.ttc",
+        "C:/Windows/Fonts/seguiemj.ttf",
+    ]
+    pats += glob.glob("/usr/share/fonts/**/NotoColorEmoji*", recursive=True)
+    pats += glob.glob("/usr/share/fonts/**/*[Ee]moji*", recursive=True)
+    for p in pats:
+        if p and os.path.exists(p):
+            _emoji_font = p
+            return p
+    return None
+
+
+def _fallback_sticker(w, h):
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    m = max(4, min(w, h) // 14)
+    d.rounded_rectangle([m, m, w - m, h - m], radius=min(w, h) // 4,
+                        fill=(255, 45, 120, 255), outline=(255, 255, 255, 255), width=max(3, m))
+    txt = "18+"
+    try:
+        fp = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        font = ImageFont.truetype(fp, int(min(w, h) * 0.42)) if os.path.exists(fp) else ImageFont.load_default()
+    except Exception:
+        font = ImageFont.load_default()
+    box = d.textbbox((0, 0), txt, font=font)
+    d.text(((w - (box[2] - box[0])) / 2, (h - (box[3] - box[1])) / 2 - box[1]),
+           txt, font=font, fill=(255, 255, 255, 255))
+    return np.array(img)
+
+
+def _render_sticker(emoji, w, h):
+    w, h = max(8, int(w)), max(8, int(h))
+    key = (emoji, w // 24, h // 24)
+    if key in _sticker_cache:
+        st = _sticker_cache[key]
+        return cv2.resize(st, (w, h), interpolation=cv2.INTER_AREA) if st.shape[1] != w or st.shape[0] != h else st
+    rgba = None
+    font_path = _find_emoji_font()
+    if font_path:
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            S = 512
+            img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            font = None
+            for size in (128, 109, 96, 440, 64):
+                try:
+                    font = ImageFont.truetype(font_path, size)
+                    break
+                except Exception:
+                    continue
+            if font is None:
+                raise RuntimeError("emoji font unusable")
+            try:
+                d.text((S // 2, S // 2), emoji, font=font, anchor="mm", embedded_color=True)
+            except TypeError:
+                d.text((20, 0), emoji, font=font, embedded_color=True)
+            bbox = img.getbbox()
+            if bbox:
+                rgba = np.array(img.crop(bbox))
+        except Exception:
+            rgba = None
+    if rgba is None or rgba.ndim != 3 or rgba.shape[2] != 4:
+        rgba = _fallback_sticker(256, 256)
+    pad = max(8, int(min(rgba.shape[1], rgba.shape[0]) * 0.14))
+    H0, W0 = rgba.shape[:2]
+    canvas = np.zeros((H0 + pad * 2, W0 + pad * 2, 4), dtype=np.uint8)
+    canvas[pad:pad + H0, pad:pad + W0] = rgba
+    mask = (canvas[:, :, 3] > 12).astype(np.uint8)
+    bw = max(5, pad // 2)
+    border = cv2.dilate(mask, np.ones((bw, bw), np.uint8))
+    out = np.zeros_like(canvas)
+    out[border > 0] = (255, 255, 255, 255)
+    a = canvas[:, :, 3:4].astype(np.float32) / 255.0
+    out[:, :, :3] = (canvas[:, :, :3].astype(np.float32) * a + out[:, :, :3].astype(np.float32) * (1 - a)).astype(np.uint8)
+    out[:, :, 3] = np.maximum(out[:, :, 3], canvas[:, :, 3])
+    _sticker_cache[key] = out
+    if out.shape[1] != w or out.shape[0] != h:
+        return cv2.resize(out, (w, h), interpolation=cv2.INTER_AREA)
+    return out
+
+
+def _paste_sticker(frame, x, y, w, h, label):
+    st = _render_sticker(_emoji_for(label), w, h)
+    if st.shape[0] != h or st.shape[1] != w:
+        st = cv2.resize(st, (w, h), interpolation=cv2.INTER_AREA)
+    roi = frame[y:y + h, x:x + w]
+    if roi.shape[0] != h or roi.shape[1] != w:
+        return
+    a = (st[:, :, 3:4].astype(np.float32) / 255.0)
+    rgb = st[:, :, :3].astype(np.float32)
+    bgr = rgb[:, :, ::-1]
+    frame[y:y + h, x:x + w] = (bgr * a + roi.astype(np.float32) * (1 - a)).astype(np.uint8)
 
 
 def _anime_once(frame):
@@ -177,45 +307,72 @@ def _iou(a, b):
     return inter / union if union > 0 else 0.0
 
 
-def _merge(boxes, thr=0.3):
-    boxes = list(boxes)
+def _overlap_frac(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x0, y0 = max(ax, bx), max(ay, by)
+    x1, y1 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0, x1 - x0) * max(0, y1 - y0)
+    return inter / min(aw * ah, bw * bh) if aw * ah and bw * bh else 0.0
+
+
+def _merge_tagged(items, thr=0.45):
+    items = list(items)
     changed = True
     while changed:
         changed = False
         out = []
-        for b in boxes:
-            for i, o in enumerate(out):
-                if _iou(b, o) >= thr:
-                    x0, y0 = min(b[0], o[0]), min(b[1], o[1])
-                    x1, y1 = max(b[0] + b[2], o[0] + o[2]), max(b[1] + b[3], o[1] + o[3])
-                    out[i] = (x0, y0, x1 - x0, y1 - y0)
+        for label, box in items:
+            for i, (ol, ob) in enumerate(out):
+                if _iou(box, ob) >= thr or _overlap_frac(box, ob) >= 0.72:
+                    x0, y0 = min(box[0], ob[0]), min(box[1], ob[1])
+                    x1, y1 = max(box[0] + box[2], ob[0] + ob[2]), max(box[1] + box[3], ob[1] + ob[3])
+                    out[i] = (ol, (x0, y0, x1 - x0, y1 - y0))
                     changed = True
                     break
             else:
-                out.append(b)
-        boxes = out
-    return boxes
+                out.append((label, box))
+        items = out
+    return items
 
 
 def _grow(box, W, H):
     x, y, w, h = box
     px, py = w * CENSOR_PAD, h * CENSOR_PAD
     x0, y0, x1, y1 = x - px, y - py, x + w + px, y + h + py
-    side = max(24.0, CENSOR_MIN_FRAC * min(W, H))
+    side = max(18.0, CENSOR_MIN_FRAC * min(W, H))
     if x1 - x0 < side:
         c = (x0 + x1) / 2
         x0, x1 = c - side / 2, c + side / 2
     if y1 - y0 < side:
         c = (y0 + y1) / 2
         y0, y1 = c - side / 2, c + side / 2
+    max_w, max_h = W * 0.48, H * 0.48
+    if x1 - x0 > max_w:
+        c = (x0 + x1) / 2
+        x0, x1 = c - max_w / 2, c + max_w / 2
+    if y1 - y0 > max_h:
+        c = (y0 + y1) / 2
+        y0, y1 = c - max_h / 2, c + max_h / 2
     x0, y0 = max(0, int(x0)), max(0, int(y0))
     x1, y1 = min(W, int(math.ceil(x1))), min(H, int(math.ceil(y1)))
     return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
 
-def _apply(frame, boxes, style):
-    for x, y, w, h in boxes:
-        if w < 2 or h < 2:
+def prepare(raw, W, H):
+    tagged = [(r[0], r[-1]) for r in raw]
+    return [(label, _grow(box, W, H)) for label, box in _merge_tagged(tagged)]
+
+
+def _apply(frame, tagged_boxes, style):
+    H, W = frame.shape[:2]
+    for label, (x, y, w, h) in tagged_boxes:
+        x, y = max(0, x), max(0, y)
+        w, h = min(w, W - x), min(h, H - y)
+        if w < 4 or h < 4:
+            continue
+        if style == "sticker":
+            _paste_sticker(frame, x, y, w, h, label)
             continue
         roi = frame[y:y + h, x:x + w]
         if style == "black":
@@ -231,20 +388,44 @@ def _apply(frame, boxes, style):
             frame[y:y + h, x:x + w] = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
 
-def _fill(keys, samples, gap):
-    have = [k for k in keys if samples[k]]
-    filled = {}
-    for k in keys:
-        if samples[k]:
-            filled[k] = [b for _, _, b in samples[k]]
+def _boxes_at(f, keys, samples, gap_frames):
+    samples = {k: [(r[0], r[-1]) for r in (v or [])] for k, v in samples.items()}
+    i = bisect.bisect_right(keys, f) - 1
+    if i < 0:
+        i = 0
+    a_key = keys[i]
+    a = samples.get(a_key) or []
+    if not a:
+        for k in keys:
+            if abs(k - f) <= gap_frames and samples.get(k):
+                return samples[k]
+        return []
+    if i + 1 >= len(keys):
+        return a
+    b_key = keys[i + 1]
+    b = samples.get(b_key) or []
+    if not b or b_key - a_key > gap_frames * 2:
+        return a if f - a_key <= gap_frames else []
+    if len(a) != len(b):
+        return a
+    t = (f - a_key) / max(1, b_key - a_key)
+    out = []
+    used = set()
+    for label, box in a:
+        best_j, best_d = None, None
+        for j, (bl, bb) in enumerate(b):
+            if j in used:
+                continue
+            d = abs((bb[0] + bb[2] / 2) - (box[0] + box[2] / 2)) + abs((bb[1] + bb[3] / 2) - (box[1] + box[3] / 2))
+            if best_d is None or d < best_d:
+                best_d, best_j = d, j
+        if best_j is None:
+            out.append((label, box))
             continue
-        near = []
-        i = bisect.bisect_left(have, k)
-        for j in (i - 1, i):
-            if 0 <= j < len(have) and abs(have[j] - k) <= gap:
-                near.extend(b for _, _, b in samples[have[j]])
-        filled[k] = near
-    return filled
+        used.add(best_j)
+        bb = b[best_j][1]
+        out.append((label, tuple(int(round(box[k] + (bb[k] - box[k]) * t)) for k in range(4))))
+    return out
 
 
 def _audio_codec(path):
@@ -283,12 +464,12 @@ def censor_image(src, dst, style=None):
         frame = np.array(Image.open(src).convert("RGB"))[:, :, ::-1].copy()
     H, W = frame.shape[:2]
     raw = detect_frame(frame)
-    boxes = [_grow(b, W, H) for b in _merge([r[2] for r in raw])]
-    _apply(frame, boxes, style)
+    tagged = prepare(raw, W, H)
+    _apply(frame, tagged, style)
     cv2.imwrite(dst, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
     return {
-        "path": dst, "found": len(boxes), "labels": sorted({r[0] for r in raw}),
-        "backends": censor_backends(),
+        "path": dst, "found": len(tagged), "labels": sorted({r[0] for r in raw}),
+        "backends": censor_backends(), "style": style,
     }
 
 
@@ -334,7 +515,7 @@ def censor_video(src, dst, prog=None, style=None):
     n_frames = idx
 
     keys = sorted(samples)
-    filled = _fill(keys, samples, max(1, int(round(fps * CENSOR_GAP_FILL))))
+    gap_frames = max(1, int(round(fps * CENSOR_GAP_FILL)))
     hits = sum(1 for k in keys if samples[k])
     found = sum(len(samples[k]) for k in keys)
 
@@ -355,22 +536,18 @@ def censor_video(src, dst, prog=None, style=None):
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
     cap = cv2.VideoCapture(src)
-    f, pos, broken = 0, 0, False
+    f, broken = 0, False
     try:
         while True:
             _check(prog)
             ok, frame = cap.read()
             if not ok:
                 break
-            while pos + 1 < len(keys) and keys[pos + 1] <= f:
-                pos += 1
-            boxes = list(filled[keys[pos]])
-            if pos + 1 < len(keys):
-                boxes += filled[keys[pos + 1]]
-            if boxes:
+            tagged = _boxes_at(f, keys, samples, gap_frames)
+            if tagged:
                 if frame.shape[:2] != (H, W):
                     frame = cv2.resize(frame, (W, H))
-                _apply(frame, [_grow(b, W, H) for b in _merge(boxes)], style)
+                _apply(frame, prepare(tagged, W, H), style)
             elif frame.shape[:2] != (H, W):
                 frame = cv2.resize(frame, (W, H))
             try:
@@ -396,7 +573,7 @@ def censor_video(src, dst, prog=None, style=None):
         raise RuntimeError("Censor encode fail")
     return {
         "path": dst, "found": found, "frames": f, "hit_frames": hits, "step": step,
-        "backends": censor_backends(),
+        "backends": censor_backends(), "style": style,
     }
 
 
