@@ -101,8 +101,11 @@ def _file_sticker(label, w, h, seed):
     files = _folder_files(_category(label))
     if not files:
         return None
-    import zlib
-    path = files[zlib.crc32(f"{label}|{seed}".encode()) % len(files)]
+    if isinstance(seed, tuple) and seed and seed[0] == "track":
+        path = files[int(seed[1]) % len(files)]
+    else:
+        import zlib
+        path = files[zlib.crc32(f"{label}|{seed}".encode()) % len(files)]
     key = ("file", path, w // 24, h // 24)
     if key in _sticker_cache:
         st = _sticker_cache[key]
@@ -275,8 +278,8 @@ def _render_sticker(emoji, w, h):
     return out
 
 
-def _paste_sticker(frame, x, y, w, h, label):
-    st = _file_sticker(label, w, h, (x // 30, y // 30))
+def _paste_sticker(frame, x, y, w, h, label, variant=None):
+    st = _file_sticker(label, w, h, ("track", variant) if variant is not None else (x // 30, y // 30))
     if st is None:
         st = _render_sticker(_emoji_for(label), w, h)
     if st.shape[0] != h or st.shape[1] != w:
@@ -380,22 +383,26 @@ def _overlap_frac(a, b):
     return inter / min(aw * ah, bw * bh) if aw * ah and bw * bh else 0.0
 
 
-def _merge_tagged(items, thr=0.45):
-    items = list(items)
+def _merge_tagged(items, thr=0.30):
+    norm = []
+    for it in items:
+        var = it[2] if len(it) > 2 else None
+        norm.append((it[0], it[1], var))
+    items = norm
     changed = True
     while changed:
         changed = False
         out = []
-        for label, box in items:
-            for i, (ol, ob) in enumerate(out):
-                if _iou(box, ob) >= thr or _overlap_frac(box, ob) >= 0.72:
+        for label, box, var in items:
+            for i, (ol, ob, ov) in enumerate(out):
+                if _iou(box, ob) >= thr or _overlap_frac(box, ob) >= 0.55:
                     x0, y0 = min(box[0], ob[0]), min(box[1], ob[1])
                     x1, y1 = max(box[0] + box[2], ob[0] + ob[2]), max(box[1] + box[3], ob[1] + ob[3])
-                    out[i] = (ol, (x0, y0, x1 - x0, y1 - y0))
+                    out[i] = (ol, (x0, y0, x1 - x0, y1 - y0), ov if ov is not None else var)
                     changed = True
                     break
             else:
-                out.append((label, box))
+                out.append((label, box, var))
         items = out
     return items
 
@@ -424,19 +431,24 @@ def _grow(box, W, H):
 
 
 def prepare(raw, W, H):
-    tagged = [(r[0], r[-1]) for r in raw]
-    return [(label, _grow(box, W, H)) for label, box in _merge_tagged(tagged)]
+    tagged = []
+    for r in raw:
+        if isinstance(r, (list, tuple)) and len(r) >= 3 and isinstance(r[1], (list, tuple)) and isinstance(r[2], int):
+            tagged.append((r[0], tuple(r[1]), r[2]))
+        else:
+            tagged.append((r[0], r[-1], None))
+    return [(label, _grow(box, W, H), var) for label, box, var in _merge_tagged(tagged)]
 
 
 def _apply(frame, tagged_boxes, style):
     H, W = frame.shape[:2]
-    for label, (x, y, w, h) in tagged_boxes:
+    for label, (x, y, w, h), var in tagged_boxes:
         x, y = max(0, x), max(0, y)
         w, h = min(w, W - x), min(h, H - y)
         if w < 4 or h < 4:
             continue
         if style == "sticker":
-            _paste_sticker(frame, x, y, w, h, label)
+            _paste_sticker(frame, x, y, w, h, label, var)
             continue
         roi = frame[y:y + h, x:x + w]
         if style == "black":
@@ -452,8 +464,84 @@ def _apply(frame, tagged_boxes, style):
             frame[y:y + h, x:x + w] = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
 
+def _center(box):
+    return (box[0] + box[2] / 2.0, box[1] + box[3] / 2.0)
+
+
+def _build_tracks(samples, gap_frames):
+    keys = sorted(samples)
+    tracks = []
+    counters = {}
+    active = []
+    out = {}
+    for k in keys:
+        dets = _merge_tagged([(r[0], r[-1]) for r in (samples.get(k) or [])])
+        frame_out = []
+        used = set()
+        for label, box, _v in dets:
+            cat = _category(label)
+            cx, cy = _center(box)
+            best, best_score = None, None
+            for ti in active:
+                if ti in used:
+                    continue
+                tr = tracks[ti]
+                if tr["cat"] != cat:
+                    continue
+                tcx, tcy = _center(tr["box"])
+                d = abs(cx - tcx) + abs(cy - tcy)
+                iou = _iou(box, tr["box"])
+                if iou >= 0.12 or d < 0.7 * max(box[2], box[3], tr["box"][2], tr["box"][3]):
+                    score = iou * 1000 - d
+                    if best_score is None or score > best_score:
+                        best, best_score = ti, score
+            if best is None:
+                var = counters.get(cat, 0)
+                counters[cat] = var + 1
+                tracks.append({"cat": cat, "box": box, "last": k, "variant": var})
+                best = len(tracks) - 1
+                active.append(best)
+            tr = tracks[best]
+            tr["box"] = box
+            tr["last"] = k
+            used.add(best)
+            frame_out.append((label, box, tr["variant"]))
+        out[k] = frame_out
+        active = [ti for ti in active if k - tracks[ti]["last"] <= gap_frames * 2]
+    _smooth_tracks(out)
+    return out
+
+
+def _smooth_tracks(tracked):
+    series = {}
+    for k in sorted(tracked):
+        for label, box, var in tracked[k]:
+            series.setdefault((_category(label), var), []).append((k, box))
+    pos = {}
+    for key, pts in series.items():
+        if len(pts) < 3:
+            continue
+        fwd = []
+        cur = None
+        for _k, b in pts:
+            cur = b if cur is None else tuple(cur[i] * 0.55 + b[i] * 0.45 for i in range(4))
+            fwd.append(cur)
+        bwd = []
+        cur = None
+        for b in reversed(fwd):
+            cur = b if cur is None else tuple(cur[i] * 0.55 + b[i] * 0.45 for i in range(4))
+            bwd.append(cur)
+        bwd.reverse()
+        for (k, _b), sb in zip(pts, bwd):
+            pos[(key, k)] = tuple(int(round(v)) for v in sb)
+    for k in tracked:
+        tracked[k] = [
+            (label, pos.get(((_category(label), var), k), box), var)
+            for label, box, var in tracked[k]
+        ]
+
+
 def _boxes_at(f, keys, samples, gap_frames):
-    samples = {k: [(r[0], r[-1]) for r in (v or [])] for k, v in samples.items()}
     i = bisect.bisect_right(keys, f) - 1
     if i < 0:
         i = 0
@@ -462,33 +550,26 @@ def _boxes_at(f, keys, samples, gap_frames):
     if not a:
         for k in keys:
             if abs(k - f) <= gap_frames and samples.get(k):
-                return samples[k]
+                return list(samples[k])
         return []
     if i + 1 >= len(keys):
-        return a
+        return list(a)
     b_key = keys[i + 1]
     b = samples.get(b_key) or []
     if not b or b_key - a_key > gap_frames * 2:
-        return a if f - a_key <= gap_frames else []
-    if len(a) != len(b):
-        return a
+        return list(a) if f - a_key <= gap_frames else []
     t = (f - a_key) / max(1, b_key - a_key)
+    bmap = {}
+    for label, box, var in b:
+        bmap[(_category(label), var)] = box
     out = []
-    used = set()
-    for label, box in a:
-        best_j, best_d = None, None
-        for j, (bl, bb) in enumerate(b):
-            if j in used:
-                continue
-            d = abs((bb[0] + bb[2] / 2) - (box[0] + box[2] / 2)) + abs((bb[1] + bb[3] / 2) - (box[1] + box[3] / 2))
-            if best_d is None or d < best_d:
-                best_d, best_j = d, j
-        if best_j is None:
-            out.append((label, box))
+    for label, box, var in a:
+        bb = bmap.get((_category(label), var))
+        if bb is None:
+            if f - a_key <= gap_frames:
+                out.append((label, box, var))
             continue
-        used.add(best_j)
-        bb = b[best_j][1]
-        out.append((label, tuple(int(round(box[k] + (bb[k] - box[k]) * t)) for k in range(4))))
+        out.append((label, tuple(int(round(box[j] + (bb[j] - box[j]) * t)) for j in range(4)), var))
     return out
 
 
@@ -580,6 +661,7 @@ def censor_video(src, dst, prog=None, style=None):
 
     keys = sorted(samples)
     gap_frames = max(1, int(round(fps * CENSOR_GAP_FILL)))
+    tracked = _build_tracks(samples, gap_frames)
     hits = sum(1 for k in keys if samples[k])
     found = sum(len(samples[k]) for k in keys)
 
@@ -607,7 +689,7 @@ def censor_video(src, dst, prog=None, style=None):
             ok, frame = cap.read()
             if not ok:
                 break
-            tagged = _boxes_at(f, keys, samples, gap_frames)
+            tagged = _boxes_at(f, keys, tracked, gap_frames)
             if tagged:
                 if frame.shape[:2] != (H, W):
                     frame = cv2.resize(frame, (W, H))
