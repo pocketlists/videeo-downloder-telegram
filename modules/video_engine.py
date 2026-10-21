@@ -28,6 +28,7 @@ from modules.post_maker import remember_sent, template_reply, URL_REGEX
 from modules.smart_tools import (
     is_preview_url, is_hard_bad_url, preview_hd_variants, same_video_urls,
     download_best_thumbnail, highlight_start, nude_window,
+    teasing_segments, motion_segments,
 )
 from modules.censor_engine import (
     censor_image, censor_any, video_seconds, CENSOR_MAX_SEC,
@@ -495,6 +496,16 @@ def cand_sort_key(c, exp_d=0):
         return (0 if ratio < 0.35 else 1, master, close, dur, c.get("score") or 0)
     bucket = 1.0 if dur >= 120 else 0.8 if dur >= 45 else 0.5 if dur >= 15 else 0.2
     return (master, bucket, dur, c.get("score") or 0)
+
+
+def is_real_video(info) -> bool:
+    if not info:
+        return False
+    if (info.get("vcodec") or "").lower() == "gif":
+        return False
+    if (info.get("width") or 0) <= 16 or (info.get("height") or 0) <= 16:
+        return False
+    return True
 
 
 def is_ad_url(u: str) -> bool:
@@ -1259,9 +1270,10 @@ def base_ydl_opts(headers=None, fast=False, imp="chrome"):
     o = {
         "quiet": True, "no_warnings": True, "noplaylist": True, "nocheckcertificate": True,
         "geo_bypass": True, "geo_bypass_country": "US",
-        "socket_timeout": 20 if fast else 35,
-        "retries": 4 if fast else 10, "extractor_retries": 4, "fragment_retries": 10,
+        "socket_timeout": 5 if fast else 35,
+        "retries": 1 if fast else 10, "extractor_retries": 1 if fast else 3, "fragment_retries": 10,
         "concurrent_fragment_downloads": 8,
+        "format_sort": ["res", "vcodec:h264", "fps", "ext"],
         "http_headers": hdrs,
         "extractor_args": {
             "youtube": {"player_client": ["android", "web", "ios"]},
@@ -1320,6 +1332,7 @@ def ydl_call(opts, fn, url=None):
 def ytdlp_extract(url, headers=None):
     last = None
     ladder = [n for n in IMP_LADDER if not n or (not NO_IMP and impersonate_target(n))] or [""]
+    ladder = ladder[:1] + ([""] if ladder and ladder[0] else [])
     for name in ladder:
         opts = base_ydl_opts(headers, True, name)
         opts["skip_download"] = True
@@ -1443,6 +1456,9 @@ async def source_from_media(media_url, page_url, cookies, title=None, thumbs=Non
         thumbs=list(thumbs or []), use_url_name=url_name, alt_urls=dict(alt_urls or {})
     )
     info = pre or await loop.run_in_executor(None, ffprobe, media_url, headers, 30)
+    if info and not is_real_video(info):
+        info = None
+        s.invalid_media = True
     if info:
         s.duration, s.height, s.size = info["duration"], info["short"], info["size"]
     if s.mode == "ytdlp":
@@ -1948,6 +1964,8 @@ async def hd_from_preview(run, preview_url, page_url, cookies, all_urls, thumbs,
             info = await run(ffprobe, u, make_headers(page_url), 25)
         except Exception:
             info = None
+        if not is_real_video(info):
+            info = None
         if not info:
             try:
                 yi = await run(ytdlp_extract, u, {"Referer": page_url})
@@ -1976,7 +1994,9 @@ async def resolve_source(url, status):
 
     if classify_media(url):
         await status("🔗 Direct link mila, check kar raha hoon…")
-        return await source_from_media(url, origin_of(url) + "/", cookies, url_name=True)
+        s = await source_from_media(url, origin_of(url) + "/", cookies, url_name=True)
+        if not getattr(s, "invalid_media", False):
+            return s
 
     generic = None
     err = ""
@@ -1988,6 +2008,8 @@ async def resolve_source(url, status):
             if (info.get("extractor_key") or "").lower() != "generic":
                 return s
             generic = s
+            if s.duration and s.duration >= 30 and not s.is_preview:
+                return s
     except Exception as e:
         err = str(e)[:300]
 
@@ -1997,10 +2019,14 @@ async def resolve_source(url, status):
     except Exception:
         qp = None
     if qp and qp["media"]:
-        probed_q = []
-        for mu, kind, is_pv in qp["media"][:8]:
+        async def _qprobe(item):
+            mu, kind, is_pv = item
             info = await run(ffprobe, mu, make_headers(url), 25)
-            if not info:
+            return mu, is_pv, info
+
+        probed_q = []
+        for mu, is_pv, info in await asyncio.gather(*[_qprobe(it) for it in qp["media"][:8]]):
+            if not is_real_video(info):
                 continue
             if qp.get("dur") and (info.get("duration") or 0) and info["duration"] < qp["dur"] * 0.35 and len(qp["media"]) > 1:
                 continue
@@ -2067,6 +2093,8 @@ async def resolve_source(url, status):
             if ch:
                 h["Cookie"] = ch
             c["info"] = await run(ffprobe, c["url"], h, 25)
+            if not is_real_video(c["info"]):
+                c["info"] = None
             c["dur"] = (c["info"] or {}).get("duration") or 0
             if not c["info"] and c["kind"] in ("hls", "dash"):
                 try:
@@ -2097,7 +2125,8 @@ async def resolve_source(url, status):
             )
             if is_preview_url(best["url"]):
                 src_b.is_preview, src_b.preview_url = True, best["url"]
-            pool.append(src_b)
+            if not getattr(src_b, "invalid_media", False):
+                pool.append(src_b)
     if pool:
         exp_p = (generic.duration if generic else 0) or sn.get("exp_dur") or 0
         if exp_p:
@@ -2617,6 +2646,38 @@ def post_kb(job: Job) -> InlineKeyboardMarkup:
     ])
 
 
+def stitch_segments(seg_paths, out, target_h=0, prog=None):
+    if len(seg_paths) == 1 and not target_h:
+        shutil.copyfile(seg_paths[0], out)
+        return out
+    lst = out + ".list.txt"
+    with open(lst, "w") as f:
+        for pth in seg_paths:
+            f.write("file '" + os.path.abspath(pth) + "'\n")
+    vf = []
+    if target_h:
+        vf.append(f"scale=-2:min({target_h}\\,ih)")
+    vf.append("setsar=1")
+    args = ["-f", "concat", "-safe", "0", "-i", lst,
+            "-vf", ",".join(vf), "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out]
+    run_ffmpeg(args, None, lambda c, t: prog.update("🧩 Parts jod raha hoon", c, t, "time") if prog else None,
+               stop=prog.stop if prog else None)
+    _rm(lst)
+    return out
+
+
+def highlight_quality_kb(job):
+    hs = [h for h in (1080, 720, 480, 360) if not job.src.height or job.src.height >= h]
+    rows = [[InlineKeyboardButton("🎞 Original", callback_data=f"hlq:{job.id}:0")]]
+    if hs:
+        rows[0] += [InlineKeyboardButton(f"{h}p", callback_data=f"hlq:{job.id}:{h}") for h in hs[:2]]
+    if len(hs) > 2:
+        rows.append([InlineKeyboardButton(f"{h}p", callback_data=f"hlq:{job.id}:{h}") for h in hs[2:]])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"hlx:{job.id}")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def run_smart_clip(client, job: Job, kind: str):
     global active_downloads
     _ensure_sems()
@@ -2655,6 +2716,7 @@ async def run_smart_clip(client, job: Job, kind: str):
                     else:
                         start, why = await loop.run_in_executor(
                             None, lambda: highlight_start(path, dur, job.src.heatmap, length, prog.stop))
+                    start = max(0.0, min(start, max(0.0, dur - length)))
                     end = min(dur, start + length)
                     raw = os.path.join(workdir, "prev_raw.mp4")
                     await loop.run_in_executor(None, cut_video, path, raw, start, end, "exact", info, prog)
@@ -2672,17 +2734,34 @@ async def run_smart_clip(client, job: Job, kind: str):
                     await send_one(client, job.chat_id, r["path"], f"{base}_preview10s.mp4", cap,
                                    cinfo, post_kb(job), prog, "pv", workdir, job.reply_to)
                 else:
-                    length = 30.0 if dur >= 90 else 15.0 if dur >= 30 else dur
-                    await prog.stage("🔎 Most-watched hissa dhoondh raha hoon…")
-                    start, why = await loop.run_in_executor(
-                        None, lambda: highlight_start(path, dur, job.src.heatmap, length, prog.stop))
-                    end = min(dur, start + length)
+                    seg_len = 8.0 if dur >= 120 else 6.0 if dur >= 45 else max(3.0, dur / 4.0)
+                    nseg = 4 if dur >= 120 else 3 if dur >= 45 else 2 if dur >= 20 else 1
+                    await prog.stage("🔎 Sabse teasing hisse dhoondh raha hoon…")
+                    segs = await loop.run_in_executor(
+                        None, lambda: teasing_segments(path, dur, seg_len, nseg, prog.stop))
+                    why = "teasing parts"
+                    if not segs:
+                        segs = await loop.run_in_executor(
+                            None, lambda: motion_segments(path, dur, seg_len, nseg, prog.stop))
+                        why = "sabse zyada action/movement wale parts"
+                    if not segs:
+                        segs = [(max(0.0, dur * 0.2), 0)]
+                    parts = []
+                    for i, (stt, _sc) in enumerate(segs):
+                        sp = os.path.join(workdir, f"seg_{i}.mp4")
+                        await loop.run_in_executor(
+                            None, cut_video, path, sp, stt, min(dur, stt + seg_len), "exact", info, prog)
+                        parts.append((sp, stt))
                     outp = os.path.join(workdir, "highlight.mp4")
-                    await loop.run_in_executor(None, cut_video, path, outp, start, end, "exact", info, prog)
+                    target_h = int(getattr(job, "hl_q", 0) or 0)
+                    await loop.run_in_executor(
+                        None, stitch_segments, [p for p, _ in parts], outp, target_h, prog)
                     cinfo = ffprobe(outp) or {}
+                    plist = ", ".join(fmt_hms(stt) for _p, stt in parts)
                     cap = (
                         f"🔥 <b>Smart Highlight</b>\n\n🎬 <b>Name:</b> <code>{esc(base)}</code>\n"
-                        f"📍 <b>Part:</b> <code>{fmt_hms(start)} → {fmt_hms(end)}</code> ({esc(why)})\n"
+                        f"📍 <b>Parts:</b> <code>{esc(plist)}</code> ({esc(why)})\n"
+                        f"🎞 <b>Quality:</b> <code>{(str(target_h) + 'p') if target_h else 'Original'}</code>\n"
                         f"📦 <b>Size:</b> <code>{humanbytes(os.path.getsize(outp))}</code>"
                     )
                     await send_one(client, job.chat_id, outp, f"{base}_highlight.mp4", cap,
@@ -3462,8 +3541,33 @@ async def handle_callback(client, cq: CallbackQuery):
         await cq.answer("🔞 Censor shuru…")
         return spawn(run_censor(client, job, None), job.chat_id)
     if act == "hl":
-        await cq.answer("🔥 Smart Highlight bana raha hoon…")
+        await cq.answer("🔥 Quality chuno…")
+        m = await client.send_message(
+            job.chat_id,
+            "🔥 <b>Smart Highlight</b> — kis quality me banaun?\n"
+            "Video ke sabse <b>teasing parts</b> jod kar ek highlight banege.",
+            reply_markup=highlight_quality_kb(job),
+        )
+        if getattr(m, "id", None):
+            remember_sent(job.chat_id, m.id)
+        return
+    if act == "hlq":
+        if job.busy:
+            return await cq.answer("⏳ Pichla kaam abhi chal raha hai.", show_alert=True)
+        try:
+            job.hl_q = int(parts[2]) if len(parts) > 2 else 0
+        except Exception:
+            job.hl_q = 0
+        job.msg = cq.message
+        await cq.answer("🔥 Highlight bana raha hoon…")
         return spawn(run_smart_clip(client, job, "highlight"), job.chat_id)
+    if act == "hlx":
+        await cq.answer("❌ Cancel kar diya")
+        try:
+            await cq.message.delete()
+        except Exception:
+            pass
+        return
     if act == "pv":
         await cq.answer("🎬 10s Preview bana raha hoon…")
         return spawn(run_smart_clip(client, job, "preview"), job.chat_id)
