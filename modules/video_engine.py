@@ -1270,7 +1270,7 @@ def base_ydl_opts(headers=None, fast=False, imp="chrome"):
     o = {
         "quiet": True, "no_warnings": True, "noplaylist": True, "nocheckcertificate": True,
         "geo_bypass": True, "geo_bypass_country": "US",
-        "socket_timeout": 5 if fast else 35,
+        "socket_timeout": 10 if fast else 35,
         "retries": 1 if fast else 10, "extractor_retries": 1 if fast else 3, "fragment_retries": 10,
         "concurrent_fragment_downloads": 8,
         "format_sort": ["res", "vcodec:h264", "fps", "ext"],
@@ -1499,7 +1499,7 @@ async def sniff_page(page_url, cookies):
     res = {
         "cands": [], "title": None, "thumbs": [], "cookies": [],
         "html": "", "frames": [], "net": netlog, "final": "", "alt_urls": alt_urls,
-        "exp_dur": 0.0, "blocked": 0
+        "exp_dur": 0.0, "blocked": 0, "buttons": []
     }
 
     def add(url, score, kind, size=0, tag="", q=0):
@@ -1693,6 +1693,12 @@ async def sniff_page(page_url, cookies):
                 )
             except Exception:
                 pass
+            try:
+                res["buttons"] = await page.evaluate(
+                    """()=>{const out=[];for(const a of document.querySelectorAll('a[href]')){const t=(a.innerText||a.textContent||'').trim().replace(/\s+/g,' ');if(/download|⬇/i.test(t)||/download/i.test(a.href)){const q=(t.match(/(2160|1440|1080|720|480|360|240)\s*p/)||[])[1]||0;const sm=t.match(/([\d]+(?:[.\,]\d+)?)\s*(GB|MB|KB)/i);let sz=0;if(sm){const v=parseFloat(sm[1].replace(',','.'));sz=Math.round(v*(sm[2].toUpperCase()==='GB'?1073741824:sm[2].toUpperCase()==='MB'?1048576:1024));}out.push({url:a.href,label:t.slice(0,60),q:parseInt(q)||0,size_hint:sz});}if(out.length>=12)break;}return out}"""
+                )
+            except Exception:
+                pass
 
             async def collect_links():
                 sels = list(dict.fromkeys(list(cfg.get("download_selectors", [])) + UNIVERSAL_SELECTORS))
@@ -1875,6 +1881,36 @@ class ResolveError(Exception):
 
 
 
+def _btn_size(text):
+    m = re.search(r"([\d]+(?:[.,]\d+)?)\s*(GB|MB|KB)\b", text or "", re.I)
+    if not m:
+        return 0
+    v = float(m.group(1).replace(",", "."))
+    u = m.group(2).upper()
+    return int(v * (1024 ** 3 if u == "GB" else 1024 ** 2 if u == "MB" else 1024))
+
+
+def _extract_download_buttons(txt, base):
+    out, seen = [], set()
+    for m in re.finditer(r'<a\b[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', txt or "", re.I | re.S):
+        href = urljoin(base, html.unescape(m.group(1)))
+        if not href.startswith("http") or href in seen:
+            continue
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(m.group(2)))).strip()
+        low_t, low_h = text.lower(), href.lower()
+        qm = re.search(r"(2160|1440|1080|720|480|360|240)\s*p\b", low_t) or re.search(r"[_-](2160|1440|1080|720|480|360|240)p?(?:\.|_)", low_h)
+        is_dl = ("download" in low_t or "⬇" in text or "/download" in low_h or "download=" in low_h)
+        kind = classify_media(href)
+        if kind and (is_dl or qm) and not is_ad_url(href) and not is_hard_bad_url(href):
+            seen.add(href)
+            out.append({"url": href, "label": text[:60], "q": int(qm.group(1)) if qm else 0,
+                        "size_hint": _btn_size(text)})
+        elif is_dl and not kind and "login" not in low_h and "signup" not in low_h and "register" not in low_h:
+            seen.add(href)
+            out.append({"page": href, "label": text[:60]})
+    return out[:12]
+
+
 def quick_html_probe(url, cookies):
     try:
         sc = make_session(make_headers(url), cookies)
@@ -1951,7 +1987,21 @@ def quick_html_probe(url, cookies):
             seen.add(u)
             out.append((u, k, is_preview_url(u)))
     out.sort(key=lambda x: (x[2], 0 if x[1] == "hls" else 1, x[1] != "mp4"))
-    return {"media": out, "thumbs": list(dict.fromkeys(thumbs)), "title": title or None, "dur": dur}
+    buttons = _extract_download_buttons(un, url)
+    btn_pages = [b["page"] for b in buttons if b.get("page")][:2]
+    buttons = [b for b in buttons if b.get("url")]
+    for pg in btn_pages:
+        try:
+            t3 = html.unescape(sc.get(pg, timeout=20).text[:600000].replace("\\/", "/").replace("\\u0026", "&"))
+        except Exception:
+            continue
+        for b in _extract_download_buttons(t3, pg):
+            if b.get("url"):
+                buttons.append(b)
+    seen_b = set()
+    buttons = [b for b in buttons if not (b["url"] in seen_b or seen_b.add(b["url"]))]
+    return {"media": out, "thumbs": list(dict.fromkeys(thumbs)), "title": title or None, "dur": dur,
+            "buttons": buttons[:8]}
 
 
 async def hd_from_preview(run, preview_url, page_url, cookies, all_urls, thumbs, title):
@@ -1998,151 +2048,198 @@ async def resolve_source(url, status):
         if not getattr(s, "invalid_media", False):
             return s
 
-    generic = None
-    err = ""
-    await status("🔎 Analyzing… (Seal yt-dlp Engine)")
-    try:
-        info = await run(ytdlp_extract, url, None)
-        if info and (info.get("formats") or info.get("url")):
-            s = source_from_ytinfo(url, info, {}, cookies)
-            if (info.get("extractor_key") or "").lower() != "generic":
-                return s
-            generic = s
-            if s.duration and s.duration >= 30 and not s.is_preview:
-                return s
-    except Exception as e:
-        err = str(e)[:300]
+    async def _yt_stage():
+        generic = None
+        err = ""
+        try:
+            info = await run(ytdlp_extract, url, None)
+            if info and (info.get("formats") or info.get("url")):
+                s = source_from_ytinfo(url, info, {}, cookies)
+                if (info.get("extractor_key") or "").lower() != "generic":
+                    return s, generic, err
+                generic = s
+                if s.duration and s.duration >= 30 and not s.is_preview:
+                    return s, generic, err
+        except Exception as e:
+            err = str(e)[:300]
+        return None, generic, err
 
-    await status("⚡ Page ke andar ka video dhoondh raha hoon…")
-    try:
-        qp = await run(quick_html_probe, url, cookies)
-    except Exception:
-        qp = None
-    if qp and qp["media"]:
-        async def _qprobe(item):
-            mu, kind, is_pv = item
-            info = await run(ffprobe, mu, make_headers(url), 25)
-            return mu, is_pv, info
+    async def _page_stage():
+        await status("⚡ Page ke andar ka video dhoondh raha hoon…")
+        try:
+            qp = await run(quick_html_probe, url, cookies)
+        except Exception:
+            qp = None
+        if qp and (qp["media"] or qp.get("buttons")):
+            btns = [b for b in (qp.get("buttons") or []) if b.get("url")]
+            if btns:
+                async def _bprobe(b):
+                    info = await run(ffprobe, b["url"], make_headers(url), 25)
+                    return b, info if is_real_video(info) else None
 
-        probed_q = []
-        for mu, is_pv, info in await asyncio.gather(*[_qprobe(it) for it in qp["media"][:8]]):
-            if not is_real_video(info):
-                continue
-            if qp.get("dur") and (info.get("duration") or 0) and info["duration"] < qp["dur"] * 0.35 and len(qp["media"]) > 1:
-                continue
-            probed_q.append((info.get("duration") or 0, mu, is_pv, info))
-        probed_q.sort(key=lambda x: -x[0])
-        for _qd, mu, is_pv, info in probed_q:
-            if is_pv:
-                hd = await hd_from_preview(run, mu, url, cookies, [m for m, _, _ in qp["media"]], qp["thumbs"], qp["title"])
-                if hd:
-                    return hd
-            src = await source_from_media(mu, url, cookies, title=qp["title"], thumbs=qp["thumbs"], pre=info)
-            src.is_preview = bool(is_pv)
-            if is_pv:
-                src.preview_url = mu
-            return src
+                bok = [(b, i) for b, i in await asyncio.gather(*[_bprobe(b) for b in btns[:6]]) if i]
+                if bok:
+                    bok.sort(key=lambda x: -((x[1].get("short") or 0)))
+                    alts, sizes = {}, {}
+                    for b, i in bok:
+                        h = i.get("short") or b.get("q") or 0
+                        if h and h not in alts:
+                            alts[h] = b["url"]
+                            sizes[h] = i.get("size") or b.get("size_hint") or 0
+                    mb, mi = bok[0]
+                    src = await source_from_media(mb["url"], url, cookies, title=qp["title"], thumbs=qp["thumbs"], pre=mi, alt_urls=alts)
+                    if sizes:
+                        src.quals = sorted([(h, sizes.get(h, 0)) for h in alts], reverse=True)
+                        src.est = {h: (sizes.get(h, 0), h) for h in alts}
+                    src.from_buttons = True
+                    return src
+            async def _qprobe(item):
+                mu, kind, is_pv = item
+                info = await run(ffprobe, mu, make_headers(url), 25)
+                return mu, is_pv, info
 
-    await status("🌐 Browser Engine se video nikal raha hoon…")
-    sn = await sniff_page(url, cookies)
-    cookies2 = sn["cookies"] or cookies
-    thumbs = [urljoin(url, t) for t in sn["thumbs"] if t]
-    cands = sorted(sn["cands"], key=lambda c: -c["score"])[:8]
-    alt_urls = sn.get("alt_urls") or {}
+            probed_q = []
+            for mu, is_pv, info in await asyncio.gather(*[_qprobe(it) for it in qp["media"][:8]]):
+                if not is_real_video(info):
+                    continue
+                if qp.get("dur") and (info.get("duration") or 0) and info["duration"] < qp["dur"] * 0.35 and len(qp["media"]) > 1:
+                    continue
+                probed_q.append((info.get("duration") or 0, mu, is_pv, info))
+            probed_q.sort(key=lambda x: -x[0])
+            for _qd, mu, is_pv, info in probed_q:
+                if is_pv:
+                    hd = await hd_from_preview(run, mu, url, cookies, [m for m, _, _ in qp["media"]], qp["thumbs"], qp["title"])
+                    if hd:
+                        return hd
+                src = await source_from_media(mu, url, cookies, title=qp["title"], thumbs=qp["thumbs"], pre=info)
+                src.is_preview = bool(is_pv)
+                if is_pv:
+                    src.preview_url = mu
+                return src
+        return None
 
-    async def try_yt(u, ck):
-        h = {"Referer": url}
+    async def _sniff_stage():
+        await status("🌐 Browser Engine se video nikal raha hoon…")
+        sn = await sniff_page(url, cookies)
+        cookies2 = sn["cookies"] or cookies
+        thumbs = [urljoin(url, t) for t in sn["thumbs"] if t]
+        cands = sorted(sn["cands"], key=lambda c: -c["score"])[:8]
+        for b in (sn.get("buttons") or [])[:6]:
+            if b.get("url") and classify_media(b["url"]):
+                cands.append({"url": b["url"], "score": 420, "kind": classify_media(b["url"]) or "mp4", "size": 0, "tag": "BTN"})
+        alt_urls = sn.get("alt_urls") or {}
+        _fin, generic, err = await t_yt
+
+        async def try_yt(u, ck):
+            h = {"Referer": url}
+            if ck:
+                h["Cookie"] = ck
+            try:
+                info = await run(ytdlp_extract, u, h)
+            except Exception:
+                return None
+            if not (info and (info.get("formats") or info.get("url"))):
+                return None
+            sc = source_from_ytinfo(u, info, h, cookies2)
+            sc.thumbs += thumbs
+            return sc
+
+        tasks = [try_yt(f, None) for f in sn["frames"][:4]]
+        ck = cookie_header(url, cookies2)
         if ck:
-            h["Cookie"] = ck
-        try:
-            info = await run(ytdlp_extract, u, h)
-        except Exception:
-            return None
-        if not (info and (info.get("formats") or info.get("url"))):
-            return None
-        sc = source_from_ytinfo(u, info, h, cookies2)
-        sc.thumbs += thumbs
-        return sc
+            tasks.append(try_yt(url, ck))
+        if sn.get("final") and sn["final"] != url:
+            tasks.append(try_yt(sn["final"], ck))
+        pool = [x for x in await asyncio.gather(*tasks) if x]
+        if generic:
+            pool.append(generic)
 
-    tasks = [try_yt(f, None) for f in sn["frames"][:4]]
-    ck = cookie_header(url, cookies2)
-    if ck:
-        tasks.append(try_yt(url, ck))
-    if sn.get("final") and sn["final"] != url:
-        tasks.append(try_yt(sn["final"], ck))
-    pool = [x for x in await asyncio.gather(*tasks) if x]
-    if generic:
-        pool.append(generic)
+        if not cands:
+            try:
+                sc = make_session(make_headers(url), cookies)
+                txt = (await run(lambda: sc.get(url, timeout=25).text))[:600000]
+                for u in scan_html_for_media(txt, url)[:6]:
+                    cands.append({"url": u, "score": 110, "kind": classify_media(u) or "mp4", "size": 0, "tag": "RAW"})
+            except Exception:
+                pass
 
-    if not cands:
-        try:
-            sc = make_session(make_headers(url), cookies)
-            txt = (await run(lambda: sc.get(url, timeout=25).text))[:600000]
-            for u in scan_html_for_media(txt, url)[:6]:
-                cands.append({"url": u, "score": 110, "kind": classify_media(u) or "mp4", "size": 0, "tag": "RAW"})
-        except Exception:
-            pass
+        if cands:
+            await status("🧪 Video streams check kar raha hoon…")
+            hdr = make_headers(url)
 
-    if cands:
-        await status("🧪 Video streams check kar raha hoon…")
-        hdr = make_headers(url)
+            async def probe(c):
+                h = dict(hdr)
+                ch = cookie_header(c["url"], cookies2)
+                if ch:
+                    h["Cookie"] = ch
+                c["info"] = await run(ffprobe, c["url"], h, 25)
+                if not is_real_video(c["info"]):
+                    c["info"] = None
+                c["dur"] = (c["info"] or {}).get("duration") or 0
+                if not c["info"] and c["kind"] in ("hls", "dash"):
+                    try:
+                        yi = await run(ytdlp_extract, c["url"], h)
+                    except Exception:
+                        yi = None
+                    if yi:
+                        c["dur"] = float(yi.get("duration") or 0) or c["dur"]
+                        if c["dur"]:
+                            c["info"] = {"duration": c["dur"], "short": 0, "size": 0}
 
-        async def probe(c):
-            h = dict(hdr)
-            ch = cookie_header(c["url"], cookies2)
-            if ch:
-                h["Cookie"] = ch
-            c["info"] = await run(ffprobe, c["url"], h, 25)
-            if not is_real_video(c["info"]):
-                c["info"] = None
-            c["dur"] = (c["info"] or {}).get("duration") or 0
-            if not c["info"] and c["kind"] in ("hls", "dash"):
-                try:
-                    yi = await run(ytdlp_extract, c["url"], h)
-                except Exception:
-                    yi = None
-                if yi:
-                    c["dur"] = float(yi.get("duration") or 0) or c["dur"]
-                    if c["dur"]:
-                        c["info"] = {"duration": c["dur"], "short": 0, "size": 0}
+            await asyncio.gather(*[probe(c) for c in cands])
+            valid = [c for c in cands if c["info"]]
+            exp_d = sn.get("exp_dur") or (generic.duration if generic else 0) or 0
 
-        await asyncio.gather(*[probe(c) for c in cands])
-        valid = [c for c in cands if c["info"]]
-        exp_d = sn.get("exp_dur") or (generic.duration if generic else 0) or 0
+            cand_key = lambda c: cand_sort_key(c, exp_d)
 
-        cand_key = lambda c: cand_sort_key(c, exp_d)
+            best = max(valid, key=cand_key) if valid else (cands[0] if cands[0]["score"] >= 150 else None)
+            if best:
+                if is_preview_url(best["url"]):
+                    all_u = [c["url"] for c in cands] + list(alt_urls.values())
+                    hd = await hd_from_preview(run, best["url"], url, cookies2, all_u, thumbs, sn["title"])
+                    if hd:
+                        pool.append(hd)
+                src_b = await source_from_media(
+                    best["url"], url, cookies2, title=sn["title"], thumbs=thumbs,
+                    pre=best.get("info"), alt_urls=alt_urls
+                )
+                if is_preview_url(best["url"]):
+                    src_b.is_preview, src_b.preview_url = True, best["url"]
+                if not getattr(src_b, "invalid_media", False):
+                    pool.append(src_b)
+        if pool:
+            exp_p = (generic.duration if generic else 0) or sn.get("exp_dur") or 0
+            if exp_p:
+                return max(pool, key=lambda x: (x.duration >= exp_p * 0.5, -abs((x.duration or 0) - exp_p), len(x.quals)))
+            return max(pool, key=lambda x: (x.duration >= 15, len(x.quals), x.duration))
 
-        best = max(valid, key=cand_key) if valid else (cands[0] if cands[0]["score"] >= 150 else None)
-        if best:
-            if is_preview_url(best["url"]):
-                all_u = [c["url"] for c in cands] + list(alt_urls.values())
-                hd = await hd_from_preview(run, best["url"], url, cookies2, all_u, thumbs, sn["title"])
-                if hd:
-                    pool.append(hd)
-            src_b = await source_from_media(
-                best["url"], url, cookies2, title=sn["title"], thumbs=thumbs,
-                pre=best.get("info"), alt_urls=alt_urls
-            )
-            if is_preview_url(best["url"]):
-                src_b.is_preview, src_b.preview_url = True, best["url"]
-            if not getattr(src_b, "invalid_media", False):
-                pool.append(src_b)
-    if pool:
-        exp_p = (generic.duration if generic else 0) or sn.get("exp_dur") or 0
-        if exp_p:
-            return max(pool, key=lambda x: (x.duration >= exp_p * 0.5, -abs((x.duration or 0) - exp_p), len(x.quals)))
-        return max(pool, key=lambda x: (x.duration >= 15, len(x.quals), x.duration))
+        diag = {
+            "url": url, "cands": cands, "net": sn.get("net") or [], "html": sn.get("html") or "",
+            "cookies": cookies2, "title": sn["title"], "thumbs": thumbs
+        }
+        if ai_model:
+            await status("🤖 Gemini AI se link nikal raha hoon…")
+            u = await run(gemini_find_url, url, sn.get("html"), sn.get("net"), cands)
+            if u:
+                return await source_from_media(u, url, cookies2, title=sn["title"], thumbs=thumbs)
+        raise ResolveError(err or "Video extract nahi ho paaya", diag)
 
-    diag = {
-        "url": url, "cands": cands, "net": sn.get("net") or [], "html": sn.get("html") or "",
-        "cookies": cookies2, "title": sn["title"], "thumbs": thumbs
-    }
-    if ai_model:
-        await status("🤖 Gemini AI se link nikal raha hoon…")
-        u = await run(gemini_find_url, url, sn.get("html"), sn.get("net"), cands)
-        if u:
-            return await source_from_media(u, url, cookies2, title=sn["title"], thumbs=thumbs)
-    raise ResolveError(err or "Video extract nahi ho paaya", diag)
+    await status("🔎 Analyzing… (saare engines ek saath chal rahe hain)")
+    t_yt = asyncio.ensure_future(_yt_stage())
+    t_page = asyncio.ensure_future(_page_stage())
+    t_sniff = asyncio.ensure_future(_sniff_stage())
+    try:
+        final, _g, _e = await t_yt
+        if final:
+            return final
+        src = await t_page
+        if src:
+            return src
+        return await t_sniff
+    finally:
+        for t in (t_yt, t_page, t_sniff):
+            if not t.done():
+                t.cancel()
 
 
 def _largest_media_file(workdir, since=0.0):
