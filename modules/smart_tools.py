@@ -300,3 +300,82 @@ def hash_sim(a, b):
     if a is None or b is None:
         return 0.0
     return 1.0 - (bin(int(a) ^ int(b)).count("1") / 64.0)
+
+
+def _tease_score(labels):
+    score = 0.0
+    for label in labels:
+        up = str(label).upper()
+        if "GENITALIA" in up or "ANUS" in up:
+            score -= 6.0
+        elif "EXPOSED" in up:
+            score += 1.5 if "BELLY" in up else -4.0
+        elif "COVERED" in up or "BELLY" in up or "ARMPIT" in up:
+            score += 2.0
+        elif "BREAST" in up or "BUTTOCK" in up:
+            score += 1.0
+    return score
+
+
+def teasing_segments(path, duration, seg_len=8.0, count=4, stop=None):
+    import modules.censor_engine as cen
+    cen._load()
+    if not cen.censor_backends() or not duration:
+        return []
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return []
+    step = max(1.0, duration / 160.0)
+    scores = []
+    t = 0.5
+    try:
+        while t < max(duration, 1.0):
+            if stop is not None and stop.is_set():
+                break
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, fr = cap.read()
+            if ok:
+                s = _tease_score([r[0] for r in cen.detect_frame(fr)])
+                if s > 0:
+                    scores.append((t, s))
+            t += step
+    finally:
+        cap.release()
+    if not scores:
+        return []
+    wins = []
+    for tc, _s in scores:
+        total = sum(s for t, s in scores if tc - seg_len / 2 <= t < tc + seg_len / 2)
+        wins.append((total, tc))
+    wins.sort(reverse=True)
+    picked = []
+    for total, tc in wins:
+        start = max(0.0, min(tc - seg_len / 2, max(0.0, duration - seg_len)))
+        if all(abs(start - p) >= seg_len * 1.5 for p, _ in picked):
+            picked.append((start, total))
+        if len(picked) >= count:
+            break
+    picked.sort()
+    return picked
+
+
+def motion_segments(path, duration, seg_len=8.0, count=4, stop=None):
+    scores = motion_scores(path, duration, stop=stop)
+    if not scores or not duration:
+        return []
+    step = scores[1][0] - scores[0][0] if len(scores) > 1 else 1.0
+    n = max(1, int(round(seg_len / max(step, 0.1))))
+    vals = [v for _, v in scores]
+    cand = []
+    for i in range(len(vals)):
+        cand.append((sum(vals[i:i + n]), scores[i][0]))
+    cand.sort(reverse=True)
+    picked = []
+    for total, t0 in cand:
+        start = max(0.0, min(t0, max(0.0, duration - seg_len)))
+        if all(abs(start - p) >= seg_len * 1.5 for p, _ in picked):
+            picked.append((start, total))
+        if len(picked) >= count:
+            break
+    picked.sort()
+    return picked
