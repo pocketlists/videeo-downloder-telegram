@@ -54,6 +54,68 @@ STICKER_EMOJI = [
 ]
 DEFAULT_EMOJI = "🔞"
 
+STICKER_DIRS = []
+if os.environ.get("CENSOR_STICKER_DIR"):
+    STICKER_DIRS.append(os.environ["CENSOR_STICKER_DIR"])
+STICKER_DIRS += [
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "stickers"),
+    os.path.join(os.getcwd(), "assets", "stickers"),
+    os.path.join(os.getcwd(), "stickers"),
+]
+_folder_cache = {}
+
+
+def _category(label):
+    up = (label or "").upper()
+    if "BREAST" in up:
+        return "breast"
+    if "GENITALIA" in up:
+        return "genitalia"
+    if "BUTTOCK" in up:
+        return "buttocks"
+    if "ANUS" in up:
+        return "anus"
+    if "BELLY" in up:
+        return "belly"
+    if "FACE" in up:
+        return "face"
+    return "default"
+
+
+def _folder_files(cat):
+    if cat in _folder_cache:
+        return _folder_cache[cat]
+    files = []
+    for d in STICKER_DIRS:
+        if d and os.path.isdir(d):
+            files = sorted(glob.glob(os.path.join(d, cat + "*.png")))
+            if not files:
+                files = sorted(glob.glob(os.path.join(d, "*.png")))
+            if files:
+                break
+    _folder_cache[cat] = files
+    return files
+
+
+def _file_sticker(label, w, h, seed):
+    files = _folder_files(_category(label))
+    if not files:
+        return None
+    import zlib
+    path = files[zlib.crc32(f"{label}|{seed}".encode()) % len(files)]
+    key = ("file", path, w // 24, h // 24)
+    if key in _sticker_cache:
+        st = _sticker_cache[key]
+        return cv2.resize(st, (w, h), interpolation=cv2.INTER_AREA) if st.shape[1] != w or st.shape[0] != h else st
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None or img.ndim != 3 or img.shape[2] != 4:
+        return None
+    img = img[:, :, [2, 1, 0, 3]]
+    _sticker_cache[key] = img
+    if img.shape[1] != w or img.shape[0] != h:
+        return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+    return img
+
 _lock = threading.Lock()
 _state = {"ready": False, "anime": None, "nude": None}
 _sticker_cache = {}
@@ -214,7 +276,9 @@ def _render_sticker(emoji, w, h):
 
 
 def _paste_sticker(frame, x, y, w, h, label):
-    st = _render_sticker(_emoji_for(label), w, h)
+    st = _file_sticker(label, w, h, (x // 30, y // 30))
+    if st is None:
+        st = _render_sticker(_emoji_for(label), w, h)
     if st.shape[0] != h or st.shape[1] != w:
         st = cv2.resize(st, (w, h), interpolation=cv2.INTER_AREA)
     roi = frame[y:y + h, x:x + w]
