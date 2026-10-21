@@ -824,9 +824,12 @@ async def highlight_cmd(client, message: Message):
         return await _reply(message, "🔥 Pehle koi video ka link bhejo, phir /highlight karo.")
     if job.busy:
         return await _reply(message, "⏳ Pichla kaam abhi chal raha hai.")
-    st = await _reply(message, "🔥 Smart Highlight bana raha hoon…")
-    job.msg = st
-    ve.spawn(ve.run_smart_clip(client, job, "highlight"), message.chat.id)
+    await _reply(
+        message,
+        "🔥 <b>Smart Highlight</b> — kis quality me banaun?\n"
+        "Video ke sabse <b>teasing parts</b> jod kar ek highlight banege.",
+        reply_markup=ve.highlight_quality_kb(job),
+    )
 
 
 @app.on_message(_cmd("preview"))
