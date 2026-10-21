@@ -1,4 +1,3 @@
-# ==================== PART 1 OF 2 ====================
 import os
 import re
 import math
@@ -26,6 +25,10 @@ from pyrogram.errors import FloodWait
 from playwright.async_api import async_playwright
 
 from modules.post_maker import remember_sent, template_reply, URL_REGEX
+from modules.smart_tools import (
+    is_preview_url, is_hard_bad_url, preview_hd_variants, same_video_urls,
+    download_best_thumbnail, highlight_start, nude_window,
+)
 from modules.censor_engine import (
     censor_image, censor_any, video_seconds, CENSOR_MAX_SEC,
 )
@@ -396,7 +399,7 @@ AGE_COOKIES = (
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.ico', '.bmp', '.avif')
 VIDEO_FILE_EXTS = ('.mp4', '.webm', '.mkv', '.mov', '.m4v', '.avi', '.flv')
 SEGMENT_EXTS = ('.ts', '.m4s', '.aac', '.m4a', '.vtt', '.srt', '.key', '.mp3')
-BAD_KEYWORDS = ('preview', 'thumb', 'poster', 'sprite', 'trailer', 'placeholder', 'banner')
+BAD_KEYWORDS = ('thumb', 'poster', 'sprite', 'placeholder', 'banner')
 SEG_RE = re.compile(r'(?:^|[/_\-.])(?:seg(?:ment)?|chunk|frag(?:ment)?)[-_]?\d+', re.I)
 
 
@@ -591,6 +594,9 @@ class Source:
     thumbs: list = field(default_factory=list)
     use_url_name: bool = False
     imp: str = "chrome"
+    heatmap: list = field(default_factory=list)
+    is_preview: bool = False
+    preview_url: str = ""
     alt_urls: dict = field(default_factory=dict)
 
 
@@ -1328,6 +1334,7 @@ def source_from_ytinfo(url, info, headers, cookies):
     s.size = s.est[MAX_HEIGHT][0] or int(info.get("filesize") or info.get("filesize_approx") or 0)
     s.quals = build_quals(s.formats, s.duration, s.height, s.size)
     s.imp = info.get("__imp", "chrome")
+    s.heatmap = info.get("heatmap") or []
     return s
 
 
@@ -1362,7 +1369,6 @@ async def source_from_media(media_url, page_url, cookies, title=None, thumbs=Non
     else:
         s.quals = build_quals(s.formats, s.duration, s.height, s.size)
     return s
-# ==================== PART 2 OF 2 ====================
 def scan_html_for_media(text, base):
     text = html.unescape((text or "").replace("\\/", "/").replace("\\u0026", "&"))
     found = []
@@ -1406,6 +1412,12 @@ async def sniff_page(page_url, cookies):
             hd = resp.headers
             ctype = (hd.get("content-type") or "").split(";")[0].strip().lower()
             if ctype.startswith("image/"):
+                try:
+                    sz = int(hd.get("content-length") or 0)
+                except ValueError:
+                    sz = 0
+                if sz >= 25000 and not is_hard_bad_url(url) and len(res["thumbs"]) < 14:
+                    res["thumbs"].append(url)
                 return
             total = 0
             mt = re.search(r"/(\d+)$", hd.get("content-range", "") or "")
@@ -1452,6 +1464,8 @@ async def sniff_page(page_url, cookies):
             qm = re.search(r"(2160|1440|1080|720|480|360)p?", path)
             qn = int(qm.group(1)) if qm else 0
             score += 110 if qn >= 1080 else 75 if qn == 720 else 35 if qn == 480 else 0
+            if is_preview_url(url):
+                score -= 80
             add(url, score, kind, total, "NET", qn)
         except Exception:
             pass
@@ -1482,7 +1496,7 @@ async def sniff_page(page_url, cookies):
                 pass
 
             async def route(r):
-                if r.request.resource_type in ("image", "font"):
+                if r.request.resource_type in ("font",):
                     await r.abort()
                 else:
                     await r.continue_()
@@ -1545,9 +1559,12 @@ async def sniff_page(page_url, cookies):
                 pass
             try:
                 res["thumbs"] = await page.evaluate(
-                    """()=>{const r=[];document.querySelectorAll('meta[property="og:image"],meta[name="twitter:image"]')
-                    .forEach(m=>m.content&&r.push(m.content));document.querySelectorAll('video[poster]')
-                    .forEach(v=>r.push(v.poster));return r}"""
+                    """()=>{const r=[];document.querySelectorAll('meta[property="og:image"],meta[property="og:image:secure_url"],meta[name="twitter:image"],meta[name="twitter:image:src"]')
+                    .forEach(m=>m.content&&r.push(m.content));document.querySelectorAll('link[rel="image_src"]')
+                    .forEach(m=>m.href&&r.push(m.href));document.querySelectorAll('video[poster]')
+                    .forEach(v=>v.poster&&r.push(v.poster));const im=[...document.querySelectorAll('img')]
+                    .filter(i=>i.naturalWidth>=480&&i.naturalHeight>=270).sort((a,b)=>b.naturalWidth*b.naturalHeight-a.naturalWidth*a.naturalHeight);
+                    im.slice(0,3).forEach(i=>r.push(i.currentSrc||i.src));return [...new Set(r)]}"""
                 )
             except Exception:
                 pass
@@ -1577,7 +1594,7 @@ async def sniff_page(page_url, cookies):
                                 pass
                             q = re.search(r"(2160|1440|1080|720|480|360)p?", txt + " " + u)
                             qn = int(q.group(1)) if q else 0
-                            score = 250 + (100 if qn >= 1080 else 60 if qn >= 720 else 20 if qn >= 480 else 0)
+                            score = 250 + (100 if qn >= 1080 else 60 if qn >= 720 else 20 if qn >= 480 else 0) - (90 if is_preview_url(u) else 0)
                             add(u, score, classify_media(u) or "mp4", 0, "HREF", qn)
                         except Exception:
                             continue
@@ -1719,6 +1736,82 @@ class ResolveError(Exception):
         self.diag = diag or {}
 
 
+
+def quick_html_probe(url, cookies):
+    try:
+        sc = make_session(make_headers(url), cookies)
+        txt = sc.get(url, timeout=25).text[:900000]
+    except Exception:
+        return None
+    if not txt:
+        return None
+    un = html.unescape(txt.replace("\\/", "/").replace("\\u0026", "&"))
+
+    def meta(prop):
+        m = re.search(r'(?:property|name)=["\']' + re.escape(prop) + r'["\'][^>]*content=["\']([^"\']+)', un, re.I)
+        if not m:
+            m = re.search(r'content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']' + re.escape(prop) + r'["\']', un, re.I)
+        return m.group(1) if m else ""
+
+    media = []
+    for prop in ("og:video:secure_url", "og:video", "og:video:url", "twitter:player:stream"):
+        v = meta(prop)
+        if v:
+            media.append(urljoin(url, v))
+    for m in re.finditer(r'"contentUrl"\s*:\s*"([^"]+)"', un):
+        media.append(urljoin(url, m.group(1)))
+    for m in re.finditer(r'<source[^>]+src=["\']([^"\']+)', un, re.I):
+        media.append(urljoin(url, m.group(1)))
+    media += scan_html_for_media(un, url)
+    thumbs = []
+    for prop in ("og:image:secure_url", "og:image", "twitter:image", "twitter:image:src"):
+        v = meta(prop)
+        if v:
+            thumbs.append(urljoin(url, v))
+    for m in re.finditer(r'"thumbnailUrl"\s*:\s*"(https?://[^"]+)"', un):
+        thumbs.append(m.group(1))
+    title = meta("og:title") or meta("twitter:title")
+    out, seen = [], set()
+    for u in media:
+        k = classify_media(u)
+        if u.startswith("http") and u not in seen and k and not is_hard_bad_url(u):
+            seen.add(u)
+            out.append((u, k, is_preview_url(u)))
+    out.sort(key=lambda x: (x[2], x[1] != "mp4"))
+    return {"media": out, "thumbs": list(dict.fromkeys(thumbs)), "title": title or None}
+
+
+async def hd_from_preview(run, preview_url, page_url, cookies, all_urls, thumbs, title):
+    tries = preview_hd_variants(preview_url) + same_video_urls(all_urls, preview_url)
+    base_info = await run(ffprobe, preview_url, make_headers(page_url), 25)
+    base_dur = (base_info or {}).get("duration") or 0
+    base_h = (base_info or {}).get("short") or 0
+    for u in dict.fromkeys(tries):
+        try:
+            info = await run(ffprobe, u, make_headers(page_url), 25)
+        except Exception:
+            info = None
+        if not info:
+            try:
+                yi = await run(ytdlp_extract, u, {"Referer": page_url})
+            except Exception:
+                yi = None
+            if yi and (yi.get("formats") or yi.get("url")):
+                src = source_from_ytinfo(u, yi, {"Referer": page_url}, cookies)
+                src.is_preview, src.preview_url = True, preview_url
+                src.thumbs = list(dict.fromkeys((src.thumbs or []) + list(thumbs or [])))
+                if title:
+                    src.title = title
+                return src
+            continue
+        dur, hh = info.get("duration") or 0, info.get("short") or 0
+        if (base_dur and dur > base_dur * 1.4) or (base_h and hh > base_h) or (not base_dur and not base_h):
+            src = await source_from_media(u, page_url, cookies, title=title, thumbs=thumbs, pre=info)
+            src.is_preview, src.preview_url = True, preview_url
+            return src
+    return None
+
+
 async def resolve_source(url, status):
     loop = asyncio.get_running_loop()
     cookies = load_cookie_list()
@@ -1735,11 +1828,31 @@ async def resolve_source(url, status):
         info = await run(ytdlp_extract, url, None)
         if info and (info.get("formats") or info.get("url")):
             s = source_from_ytinfo(url, info, {}, cookies)
-            if (info.get("extractor_key") or "").lower() != "generic" or s.duration >= 30 or len(s.formats) > 1:
+            if (info.get("extractor_key") or "").lower() != "generic":
                 return s
             generic = s
     except Exception as e:
         err = str(e)[:300]
+
+    await status("⚡ Page ke andar ka video dhoondh raha hoon…")
+    try:
+        qp = await run(quick_html_probe, url, cookies)
+    except Exception:
+        qp = None
+    if qp and qp["media"]:
+        for mu, kind, is_pv in qp["media"][:4]:
+            info = await run(ffprobe, mu, make_headers(url), 25)
+            if not info:
+                continue
+            if is_pv:
+                hd = await hd_from_preview(run, mu, url, cookies, [m for m, _, _ in qp["media"]], qp["thumbs"], qp["title"])
+                if hd:
+                    return hd
+            src = await source_from_media(mu, url, cookies, title=qp["title"], thumbs=qp["thumbs"], pre=info)
+            src.is_preview = bool(is_pv)
+            if is_pv:
+                src.preview_url = mu
+            return src
 
     await status("🌐 Browser Engine se video nikal raha hoon…")
     sn = await sniff_page(url, cookies)
@@ -1800,12 +1913,18 @@ async def resolve_source(url, status):
             if valid else (cands[0] if cands[0]["score"] >= 150 else None)
         )
         if best:
-            pool.append(
-                await source_from_media(
-                    best["url"], url, cookies2, title=sn["title"], thumbs=thumbs,
-                    pre=best.get("info"), alt_urls=alt_urls
-                )
+            if is_preview_url(best["url"]):
+                all_u = [c["url"] for c in cands] + list(alt_urls.values())
+                hd = await hd_from_preview(run, best["url"], url, cookies2, all_u, thumbs, sn["title"])
+                if hd:
+                    pool.append(hd)
+            src_b = await source_from_media(
+                best["url"], url, cookies2, title=sn["title"], thumbs=thumbs,
+                pre=best.get("info"), alt_urls=alt_urls
             )
+            if is_preview_url(best["url"]):
+                src_b.is_preview, src_b.preview_url = True, best["url"]
+            pool.append(src_b)
     if pool:
         return max(pool, key=lambda x: (x.duration >= 15, len(x.quals), x.duration))
 
@@ -2124,56 +2243,139 @@ def fetch_thumbnail(job: Job):
         return job.thumb_path
     s = job.src
     sess = make_session(make_headers(s.page_url), s.cookies)
-    best, bscore = None, -1.0
-    for i, u in enumerate(s.thumbs[:10]):
-        try:
-            r = sess.get(u, timeout=20, headers={"Accept": "image/*,*/*"})
-            ct = (r.headers.get("content-type") or "").lower()
-            if r.status_code != 200 or not ct.startswith("image/") or len(r.content) < 6 * 1024:
-                continue
-            ext = ".png" if "png" in ct else ".webp" if "webp" in ct else ".jpg"
-            raw = os.path.join(THUMB_DIR, f"{job.id}_c{i}{ext}")
-            with open(raw, "wb") as f:
-                f.write(r.content)
-            sc = _img_quality(raw)
-            if sc > bscore:
-                if best:
-                    _rm(best)
-                best, bscore = raw, sc
-            else:
-                _rm(raw)
-        except Exception:
-            continue
+    best, bw, bh = download_best_thumbnail(s.thumbs[:12], sess, THUMB_DIR, job.id)
+    if best and bw >= 480:
+        job.thumb_path = best
+        return best
     frame_url = _direct_frame_url(s)
-    if bscore < 900_000.0 and frame_url:
+    if frame_url:
+        hdrs = dict(s.headers) if s.headers else make_headers(s.page_url)
+        if "Referer" not in hdrs and s.page_url:
+            hdrs["Referer"] = s.page_url
         dur = s.duration or 30
+        fbest, fscore = None, -1.0
         for k, frac in enumerate((0.08, 0.25, 0.5, 0.75)):
             cand = os.path.join(THUMB_DIR, f"{job.id}_fr{k}.jpg")
             try:
-                grab_frame(frame_url, cand, at=max(1.0, dur * frac), headers=dict(s.headers))
+                grab_frame(frame_url, cand, at=max(1.0, dur * frac), headers=hdrs, quality=1)
             except Exception:
                 continue
             if not os.path.exists(cand):
                 continue
             sc = _img_quality(cand)
-            if sc > bscore:
-                if best:
-                    _rm(best)
-                best, bscore = cand, sc
+            if sc > fscore:
+                if fbest:
+                    _rm(fbest)
+                fbest, fscore = cand, sc
             else:
                 _rm(cand)
+        if fbest and (not best or fscore > bw * bh * 1.2):
+            if best:
+                _rm(best)
+            best = fbest
+        elif fbest:
+            _rm(fbest)
     if best:
         job.thumb_path = best
     return best
 
 
 def post_kb(job: Job) -> InlineKeyboardMarkup:
-    """Har bheji gayi video ke saath — Cut / Censor / Thumbnail (sirf jab user khud dabaye)."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✂️ Cut", callback_data=f"pc:{job.id}"),
-        InlineKeyboardButton("🔞 Censor", callback_data=f"pz:{job.id}"),
-        InlineKeyboardButton("🖼 Thumbnail", callback_data=f"th:{job.id}"),
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✂️ Cut", callback_data=f"pc:{job.id}"),
+            InlineKeyboardButton("🔞 Censor", callback_data=f"pz:{job.id}"),
+            InlineKeyboardButton("🖼 Thumbnail", callback_data=f"th:{job.id}"),
+        ],
+        [
+            InlineKeyboardButton("🔥 Smart Highlight", callback_data=f"hl:{job.id}"),
+            InlineKeyboardButton("🎬 10s Preview", callback_data=f"pv:{job.id}"),
+        ],
+    ])
+
+
+async def run_smart_clip(client, job: Job, kind: str):
+    global active_downloads
+    _ensure_sems()
+    loop = asyncio.get_running_loop()
+    job.busy = True
+    msg = job.msg
+    label = "🎬 10s Preview" if kind == "preview" else "🔥 Smart Highlight"
+    prog = Progress(loop, msg, f"{label}: <b>{esc(job.src.title[:55])}</b>", stop_event(job.chat_id))
+    workdir = os.path.join(DOWNLOAD_DIR, f"sc_{job.id}_{int(time.time())}")
+    os.makedirs(workdir, exist_ok=True)
+    try:
+        async with DL_SEM:
+            active_downloads += 1
+            try:
+                await prog.stage("⬇️ Video laa raha hoon…")
+                path = await loop.run_in_executor(None, download_media, job.src, workdir, prog, job.q, False)
+                info = ffprobe(path) or {}
+                dur = info.get("duration") or job.src.duration or 0
+                if not dur:
+                    raise RuntimeError("Video duration nahi mili")
+                base = sanitize_filename(job.src.title or "video")
+                if kind == "preview":
+                    length = min(10.0, dur)
+                    await prog.stage("🔎 Sabse hot hissa dhoondh raha hoon…")
+                    nstart, hits = await loop.run_in_executor(None, nude_window, path, dur, 10.0)
+                    if nstart is not None:
+                        start, why = nstart, f"nudity-part • {hits} hits"
+                    else:
+                        start, why = await loop.run_in_executor(
+                            None, lambda: highlight_start(path, dur, job.src.heatmap, length, prog.stop))
+                    end = min(dur, start + length)
+                    raw = os.path.join(workdir, "prev_raw.mp4")
+                    await loop.run_in_executor(None, cut_video, path, raw, start, end, "exact", info, prog)
+                    if ENC_SEM.locked():
+                        await prog.stage("Queue mein hai… (pehla encode khatam hone do)")
+                    async with ENC_SEM:
+                        await prog.stage("🩹 Preview ko sticker-censor kar raha hoon (Telegram-safe)…")
+                        r = await loop.run_in_executor(None, censor_any, raw, prog, None)
+                    cinfo = ffprobe(r["path"]) or {}
+                    cap = (
+                        f"🎬 <b>10s Preview (Censored)</b>\n\n🎬 <b>Name:</b> <code>{esc(base)}</code>\n"
+                        f"📍 <b>Part:</b> <code>{fmt_hms(start)} → {fmt_hms(end)}</code> ({esc(why)})\n"
+                        f"🩹 <b>Regions hidden:</b> <code>{r.get('found', 0)}</code>"
+                    )
+                    await send_one(client, job.chat_id, r["path"], f"{base}_preview10s.mp4", cap,
+                                   cinfo, post_kb(job), prog, "pv", workdir, job.reply_to)
+                else:
+                    length = 30.0 if dur >= 90 else 15.0 if dur >= 30 else dur
+                    await prog.stage("🔎 Most-watched hissa dhoondh raha hoon…")
+                    start, why = await loop.run_in_executor(
+                        None, lambda: highlight_start(path, dur, job.src.heatmap, length, prog.stop))
+                    end = min(dur, start + length)
+                    outp = os.path.join(workdir, "highlight.mp4")
+                    await loop.run_in_executor(None, cut_video, path, outp, start, end, "exact", info, prog)
+                    cinfo = ffprobe(outp) or {}
+                    cap = (
+                        f"🔥 <b>Smart Highlight</b>\n\n🎬 <b>Name:</b> <code>{esc(base)}</code>\n"
+                        f"📍 <b>Part:</b> <code>{fmt_hms(start)} → {fmt_hms(end)}</code> ({esc(why)})\n"
+                        f"📦 <b>Size:</b> <code>{humanbytes(os.path.getsize(outp))}</code>"
+                    )
+                    await send_one(client, job.chat_id, outp, f"{base}_highlight.mp4", cap,
+                                   cinfo, post_kb(job), prog, "hl", workdir, job.reply_to)
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            finally:
+                active_downloads -= 1
+    except Cancelled:
+        await cancel_note(msg)
+    except asyncio.CancelledError:
+        await cancel_note(msg)
+        raise
+    except Exception as e:
+        logging.exception("smart clip failed")
+        try:
+            await msg.edit_text(f"❌ <b>Smart clip fail:</b>\n<code>{esc(str(e)[:300])}</code>")
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        job.busy = False
 
 
 async def run_censor(client, job: Job, mode=None):
@@ -2308,6 +2510,8 @@ def card_text(job: Job) -> str:
     for h, z in quality_options(s):
         q_str = f"{h}p{QUALITY_TAG.get(h, '')}" if h else "Best"
         lines.append(f"📺 <code>{q_str}</code>" + (f"  •  <code>~{humanbytes(z)}</code>" if z else ""))
+    if s.is_preview:
+        lines.append("🔎 <b>Note:</b> Site par preview clip mila tha — usi video ka <b>HD full version</b> ready hai, quality button dabao.")
     lines.append("\n👇 <b>Quality button chuno (ya Cut / Audio / Compress):</b>")
     return "\n".join(lines)
 
@@ -2328,6 +2532,11 @@ def card_kb(job: Job) -> InlineKeyboardMarkup:
     rows.append([
         InlineKeyboardButton("🎵 Audio", callback_data=f"au:{job.id}"),
         InlineKeyboardButton("🗜 Smart Compress", callback_data=f"zp:{job.id}")
+    ])
+    rows.append([
+        InlineKeyboardButton("🖼 HD Thumbnail", callback_data=f"th:{job.id}"),
+        InlineKeyboardButton("🔥 Smart Highlight", callback_data=f"hl:{job.id}"),
+        InlineKeyboardButton("🎬 10s Preview", callback_data=f"pv:{job.id}"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -2864,14 +3073,10 @@ async def handle_callback(client, cq: CallbackQuery):
     chat = cq.message.chat.id
 
     if act == "th":
-        if job.thumb_sent:
-            return await cq.answer("🖼 Thumbnail pehle hi bhej di hai")
-        job.thumb_sent = True
         await cq.answer("🖼 HD thumbnail la raha hoon…")
         loop = asyncio.get_running_loop()
         path = await loop.run_in_executor(None, fetch_thumbnail, job)
         if not path:
-            job.thumb_sent = False
             m = await client.send_message(chat, "❌ Is video ka thumbnail nahi mil paaya.", reply_to_message_id=job.reply_to)
             if getattr(m, "id", None):
                 remember_sent(chat, m.id)
@@ -2885,7 +3090,7 @@ async def handle_callback(client, cq: CallbackQuery):
             if getattr(m, "id", None):
                 remember_sent(chat, m.id)
         except Exception:
-            job.thumb_sent = False
+            pass
         return
 
     if job.busy:
@@ -2925,6 +3130,12 @@ async def handle_callback(client, cq: CallbackQuery):
     if act == "pz":
         await cq.answer("🔞 Censor shuru…")
         return spawn(run_censor(client, job, None), job.chat_id)
+    if act == "hl":
+        await cq.answer("🔥 Smart Highlight bana raha hoon…")
+        return spawn(run_smart_clip(client, job, "highlight"), job.chat_id)
+    if act == "pv":
+        await cq.answer("🎬 10s Preview bana raha hoon…")
+        return spawn(run_smart_clip(client, job, "preview"), job.chat_id)
     if act == "pb":
         await cq.answer("🎨 Censor (blend) shuru…")
         return spawn(run_censor(client, job, "blend"), job.chat_id)
