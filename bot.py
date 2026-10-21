@@ -54,7 +54,7 @@ HISTORY = {}
 LAST_LOCAL = {}
 
 COMMANDS = ["start", "help", "queue", "download", "compress", "censor",
-            "post", "cut", "template", "status", "ai", "cancel", "stop"]
+            "post", "cut", "template", "status", "ai", "cancel", "stop", "highlight", "preview"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -74,7 +74,8 @@ START_TEXT = (
     "<b>1️⃣ Video Download:</b> Kisi bhi website ka link bhejo. Quality buttons + ✂️ Cut + 🎵 Audio.\n"
     "<b>2️⃣ Post Maker:</b> Media + links bhejo (ya sirf Diskwala/Terabox/Telegram links) — har message ka apna alag post.\n"
     "<b>3️⃣ Auto Compress:</b> Video file bhejo — SSIM 0.985 lock ke saath size kam.\n"
-    "<b>4️⃣ Censor:</b> Anime 2D/3D + real video/image par mosaic — sirf jab tum dabao ya <code>/censor</code> likho.\n\n"
+    "<b>4️⃣ Censor:</b> Anime 2D/3D + real video/image par tight meme-sticker/emoji censor (bada blur box nahi) — sirf jab tum dabao ya <code>/censor</code> likho.\n"
+    "<b>5️⃣ Smart:</b> 🔥 Highlight = sabse zyada dekha jaane wala hissa, 🎬 Preview = hot part se 10s sticker-censored clip, 🖼 HD Thumbnail alag se download.\n\n"
     "🛑 Kuch galat chal raha ho to <code>/cancel</code> (ya sirf <code>cancel</code> likho) — sab kuch ruk jayega.\n"
     "🗣 Baat AI se bhi kar sakte ho, ya <code>/</code> commands: /download /compress /censor /post /cut /cancel"
 )
@@ -85,8 +86,8 @@ HELP_TEXT = (
     "• <b>Video file bhejo</b> → compress. Caption mein <code>censor</code> likho to censor.\n"
     "• <b>Image/Video + link</b> → post maker (har message ka alag post).\n"
     "• <b>Sirf Diskwala/Terabox links</b> → har link ka alag post.\n"
-    "• <b>Censor</b>: video/image par <code>/censor</code> reply karo. Style: <code>/censor mosaic</code>, "
-    "<code>blur</code>, <code>black</code>, <code>blend</code>. Video max "
+    "• <b>Censor</b>: video/image par <code>/censor</code> reply karo. Default style <code>sticker</code> (meme emoji, tight box). "
+    "Baaki: <code>/censor mosaic</code>, <code>blur</code>, <code>black</code>, <code>blend</code>. Video max "
     f"<code>{int(cen.CENSOR_MAX_SEC)}s</code>.\n"
     "• <b>Roko:</b> <code>/cancel</code> ya <code>/stop</code> — chal rahe kaam + queue dono band.\n"
     "• <b>Commands:</b> /download /compress /censor /post /cut /template /status /cancel"
@@ -682,6 +683,30 @@ async def cut_cmd(client, message: Message):
     if getattr(m, "id", None):
         remember_sent(message.chat.id, m.id)
     job.msg = m
+
+
+@app.on_message(_cmd("highlight"))
+async def highlight_cmd(client, message: Message):
+    job = ve.JOBS.get(ve.LAST.get(message.chat.id))
+    if not job:
+        return await _reply(message, "🔥 Pehle koi video ka link bhejo, phir /highlight karo.")
+    if job.busy:
+        return await _reply(message, "⏳ Pichla kaam abhi chal raha hai.")
+    st = await _reply(message, "🔥 Smart Highlight bana raha hoon…")
+    job.msg = st
+    ve.spawn(ve.run_smart_clip(client, job, "highlight"), message.chat.id)
+
+
+@app.on_message(_cmd("preview"))
+async def preview_cmd(client, message: Message):
+    job = ve.JOBS.get(ve.LAST.get(message.chat.id))
+    if not job:
+        return await _reply(message, "🎬 Pehle koi video ka link bhejo, phir /preview karo.")
+    if job.busy:
+        return await _reply(message, "⏳ Pichla kaam abhi chal raha hai.")
+    st = await _reply(message, "🎬 10s Preview bana raha hoon…")
+    job.msg = st
+    ve.spawn(ve.run_smart_clip(client, job, "preview"), message.chat.id)
 
 
 @app.on_message(_cmd("ai"))
