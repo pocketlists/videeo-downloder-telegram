@@ -50,11 +50,13 @@ CHAT_Q = {}
 CHAT_WORKERS = {}
 TEXT_BUF = {}
 TEXT_TASKS = {}
+FIND_WAIT = {}
+FIND_CANDS = {}
 HISTORY = {}
 LAST_LOCAL = {}
 
 COMMANDS = ["start", "help", "queue", "download", "compress", "censor",
-            "post", "cut", "template", "status", "ai", "cancel", "stop", "highlight", "preview"]
+            "post", "cut", "template", "status", "ai", "cancel", "stop", "highlight", "preview", "find"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -390,6 +392,8 @@ async def process_message(message):
     wants_censor = bool(kind) and not links and fuzzy_action(text) == "censor"
     if kind and links:
         return await post_message(app, message, links, kind, fid)
+    if message.chat.id in FIND_WAIT and kind:
+        return await find_match_media(app, message, kind)
     if wants_censor and kind == "photo":
         return await ve.censor_photo_message(app, message, None)
     if wants_censor and is_video_media(message):
@@ -478,6 +482,134 @@ async def intake(message):
     if old and not old.done():
         old.cancel()
     TEXT_TASKS[chat] = asyncio.create_task(_flush_text_later(chat))
+
+
+async def find_cmd_start(client, message, url):
+    chat = message.chat.id
+    st = await _reply(message, "🔍 <b>Page scan kar raha hoon…</b> (videos ki list nikaal raha hoon)")
+    loop = asyncio.get_running_loop()
+    try:
+        entries = await loop.run_in_executor(None, ve.scan_listing, url)
+    except Exception as e:
+        return await st.edit_text(f"❌ Page scan fail: <code>{esc(str(e)[:200])}</code>")
+    if len(entries) < 2:
+        return await st.edit_text(
+            "❌ Is page par videos ki list nahi mili. Ye kisi <b>home / category / listing page</b> ka link hona chahiye "
+            "jahan bahut si videos dikhti hain. Agar ye ek hi video ka page hai to seedha wahi link bhejo, download ho jayega."
+        )
+    FIND_WAIT[chat] = {"url": url, "entries": entries}
+    await st.edit_text(
+        f"📄 Is page par <b>{len(entries)} videos</b> mili.\n\n"
+        "Ab jis video ko tum chahte ho, uska <b>preview clip (chhoti video) ya photo/thumbnail</b> bhejo.\n"
+        "Main usi se match karke sahi video ka page khud kholunga aur <b>HD me download</b> kar dunga.\n"
+        "Agar match pakka nahi hoga to pehle tumse puchunga — galat video download nahi hoga."
+    )
+
+
+def _grab_thumb(url, path):
+    sc = ve.make_session(ve.make_headers(url), ve.load_cookie_list())
+    r = sc.get(url, timeout=20)
+    with open(path, "wb") as f:
+        f.write(r.content)
+    return path
+
+
+async def find_match_media(client, message, kind):
+    from modules.smart_tools import ahash_file, ahash_video
+    chat = message.chat.id
+    wait = FIND_WAIT.get(chat)
+    if not wait:
+        return
+    st = await _reply(message, "🔎 <b>Preview se match kar raha hoon…</b>")
+    loop = asyncio.get_running_loop()
+    workdir = os.path.join(ve.DOWNLOAD_DIR, f"find_{chat}_{int(time.time())}")
+    os.makedirs(workdir, exist_ok=True)
+    try:
+        ext = ".jpg" if kind == "photo" else ".mp4"
+        path = await client.download_media(message, file_name=os.path.join(workdir, "prev" + ext))
+        if not path:
+            return await st.edit_text("❌ Preview file download nahi ho payi, dobara bhejo.")
+        if kind == "photo":
+            h = ahash_file(path)
+            hashes = [h] if h is not None else []
+        else:
+            hashes = await loop.run_in_executor(None, ahash_video, path)
+        if not hashes:
+            return await st.edit_text("❌ Preview se koi frame nahi nikaal paya. Saaf (clear) preview clip ya photo bhejo.")
+        ranked = await loop.run_in_executor(None, ve.rank_listing_matches, wait["entries"], hashes, wait["url"])
+        if not ranked:
+            return await st.edit_text("❌ Page ki thumbnails download/match nahi ho payin. Thodi der baad dobara try karo.")
+        top = ranked[0]
+        second = ranked[1]["score"] if len(ranked) > 1 else 0.0
+        fid = f"f{int(time.time()) % 100000}{chat % 997}"
+        FIND_CANDS[fid] = {"chat": chat, "ranked": ranked[:5], "url": wait["url"]}
+        confident = top["score"] >= 0.78 and (top["score"] - second) >= 0.04
+        rows = []
+        for i, r in enumerate(ranked[:3]):
+            rows.append([InlineKeyboardButton(
+                f"⬇️ {i + 1}. {r['title'][:26]} ({int(r['score'] * 100)}%)",
+                callback_data=f"fdl:{fid}:{i}")])
+        rows.append([InlineKeyboardButton("❌ Inme se koi nahi", callback_data=f"fno:{fid}")])
+        kb = InlineKeyboardMarkup(rows)
+        if confident:
+            cap = (f"\U0001F3AF <b>Match mil gaya!</b> ({int(top['score'] * 100)}% match)\n"
+                   f"\U0001F3AC <code>{esc(top['title'])}</code>\n\nYehi video hai to download dabao \u2014 HD me aayegi.")
+        else:
+            cap = (f"\U0001F914 <b>Pakka match nahi mila.</b> Sabse zyada match wali ye lagi ({int(top['score'] * 100)}%).\n"
+                   f"\U0001F3AC <code>{esc(top['title'])}</code>\n\nSahi wali chuno, wahi HD download hogi:")
+        thumb_path = None
+        try:
+            thumb_path = await loop.run_in_executor(
+                None, _grab_thumb, top["thumb"], os.path.join(workdir, "top.jpg"))
+        except Exception:
+            thumb_path = None
+        FIND_WAIT.pop(chat, None)
+        try:
+            await st.delete()
+        except Exception:
+            pass
+        if thumb_path and os.path.getsize(thumb_path) > 0:
+            await client.send_photo(chat, thumb_path, caption=cap, reply_markup=kb)
+        else:
+            await _reply(message, cap, reply_markup=kb)
+    except Exception as e:
+        logging.exception("find match failed")
+        try:
+            await st.edit_text(f"❌ Match fail: <code>{esc(str(e)[:200])}</code>")
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def find_callback(client, cq, parts):
+    chat = cq.message.chat.id
+    data = FIND_CANDS.get(parts[1]) if len(parts) > 1 else None
+    if not data or data["chat"] != chat:
+        return await cq.answer("⏰ Ye match purana ho gaya — /find se dobara karo.", show_alert=True)
+    if parts[0] == "fno":
+        FIND_CANDS.pop(parts[1], None)
+        await cq.answer("❌ Cancel kar diya")
+        try:
+            await cq.message.edit_reply_markup(None)
+        except Exception:
+            pass
+        return await client.send_message(chat, "❌ Theek hai, koi video download nahi hogi. Dobara chahiye to /find karo.")
+    try:
+        idx = int(parts[2]) if len(parts) > 2 else 0
+    except Exception:
+        idx = 0
+    entry = data["ranked"][idx]
+    FIND_CANDS.pop(parts[1], None)
+    await cq.answer("⬇️ HD download shuru ho raha hai…")
+    try:
+        await cq.message.edit_reply_markup(None)
+    except Exception:
+        pass
+    st = await client.send_message(chat, f"🔍 <b>Analyzing…</b>\n<code>{esc(entry['page'][:60])}</code>")
+    if getattr(st, "id", None):
+        remember_sent(chat, st.id)
+    spawn(ve.analyze_url(client, st, chat, entry["page"], cq.message.id, ve.Intent(action="download", q=1080)), chat)
 
 
 async def censor_uploaded_video(client, message: Message, style=None):
@@ -709,6 +841,19 @@ async def preview_cmd(client, message: Message):
     ve.spawn(ve.run_smart_clip(client, job, "preview"), message.chat.id)
 
 
+@app.on_message(_cmd("find"))
+async def find_cmd(client, message: Message):
+    urls = extract_urls(message) or (extract_urls(message.reply_to_message) if message.reply_to_message else [])
+    if not urls:
+        return await _reply(
+            message,
+            "🔎 <b>Smart Find</b>\nPehle kisi site ke <b>home / category page</b> ka link bhejo:\n"
+            "<code>/find https://site.com/</code>\nPhir main page ki videos ki list nikaalunga, "
+            "tum preview bhejoge, main match karke HD download kar dunga."
+        )
+    await find_cmd_start(client, message, urls[0])
+
+
 @app.on_message(_cmd("ai"))
 async def ai_cmd(client, message: Message):
     q = (message.text or "").split(maxsplit=1)
@@ -722,6 +867,8 @@ async def ai_cmd(client, message: Message):
 async def on_callback(client, cq: CallbackQuery):
     parts = (cq.data or "").split(":")
     act = parts[0]
+    if act in ("fdl", "fno"):
+        return await find_callback(client, cq, parts)
     if act == "pz" and len(parts) >= 3 and parts[1] == "img":
         await cq.answer("🔞 Censor shuru…")
         try:
