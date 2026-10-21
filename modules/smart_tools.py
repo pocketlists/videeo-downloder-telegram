@@ -226,3 +226,77 @@ def nude_window(path, duration, window=10.0):
     b = max(hits, key=hits.get)
     start = max(0.0, min(b * window, max(0.0, duration - window)))
     return start, hits[b]
+
+
+def ahash_gray(gray):
+    try:
+        import cv2
+        import numpy as np
+        small = cv2.resize(gray, (8, 8), interpolation=cv2.INTER_AREA)
+        avg = float(np.mean(small))
+        bits = (small > avg).flatten()
+        h = 0
+        for b in bits:
+            h = (h << 1) | int(bool(b))
+        return h
+    except Exception:
+        return None
+
+
+def ahash_file(path):
+    try:
+        import cv2
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return None
+        return ahash_gray(img)
+    except Exception:
+        return None
+
+
+def ahash_bytes(data):
+    try:
+        import cv2
+        import numpy as np
+        if not data:
+            return None
+        arr = np.frombuffer(data, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return None
+        return ahash_gray(img)
+    except Exception:
+        return None
+
+
+def ahash_video(path, frames=6):
+    out = []
+    try:
+        import cv2
+        cap = cv2.VideoCapture(str(path))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total > 0:
+            idxs = [int(total * (i + 0.5) / frames) for i in range(frames)]
+        else:
+            idxs = [0]
+        for ix in idxs:
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, ix))
+            except Exception:
+                pass
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                h = ahash_gray(gray)
+                if h is not None:
+                    out.append(h)
+        cap.release()
+    except Exception:
+        pass
+    return out
+
+
+def hash_sim(a, b):
+    if a is None or b is None:
+        return 0.0
+    return 1.0 - (bin(int(a) ^ int(b)).count("1") / 64.0)
