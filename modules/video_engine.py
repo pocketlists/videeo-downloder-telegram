@@ -1810,6 +1810,23 @@ def quick_html_probe(url, cookies):
     for key in ("videoUrl", "masterM3U8", "hlsUrl", "hls_url", "streamUrl", "stream_url", "mp4Url", "video_url", "playUrl"):
         for m in re.finditer(r'"' + key + r'"\s*:\s*"(https?://[^"]+?\.(?:m3u8|mp4|webm|mpd)(?:\?[^"]*)?)"', un):
             media.append(urljoin(url, m.group(1)))
+    api_urls = []
+    for m in re.finditer(r'"(?:videoUrl|mediaUrl|apiUrl)"\s*:\s*"(https?://[^"]*(?:get_media|media_definitions|mediaDefinitions)[^"]*)"', un):
+        api_urls.append(urljoin(url, m.group(1)))
+    for m in re.finditer(r'https?://[^\s"\'<>]*(?:get_media|/media/)[^\s"\'<>]*', un):
+        if "pornhub" in m.group(0) or "get_media" in m.group(0):
+            api_urls.append(m.group(0))
+    for au in list(dict.fromkeys(api_urls))[:2]:
+        try:
+            r2 = sc.get(au, timeout=25)
+            t2 = html.unescape((r2.text or "").replace("\\/", "/").replace("\\u0026", "&"))[:600000]
+        except Exception:
+            continue
+        for m in re.finditer(r'"link"\s*:\s*"(https?://[^"]+)"', t2):
+            media.append(m.group(1))
+        media += scan_html_for_media(t2, au)
+        for m in re.finditer(r'https?://[^\s"\'<>]+?\.(?:m3u8|mp4)(?:\?[^\s"\'<>]*)?', t2):
+            media.append(m.group(0))
     for m in re.finditer(r'<source[^>]+src=["\']([^"\']+)', un, re.I):
         media.append(urljoin(url, m.group(1)))
     media += scan_html_for_media(un, url)
@@ -1839,7 +1856,7 @@ def quick_html_probe(url, cookies):
     out, seen = [], set()
     for u in media:
         k = classify_media(u)
-        if u.startswith("http") and u not in seen and k and not is_hard_bad_url(u):
+        if u.startswith("http") and u not in seen and k and not is_hard_bad_url(u) and not is_ad_url(u):
             seen.add(u)
             out.append((u, k, is_preview_url(u)))
     out.sort(key=lambda x: (x[2], x[1] != "mp4"))
@@ -2237,12 +2254,28 @@ def _pick_alt(alt_urls: dict, tier: int, default_url: str) -> str:
     return alt_urls[min(alt_urls)]
 
 
+def _page_fallback_download(src: Source, workdir, prog, q=0, audio=False):
+    tier = choose_tier(src, q)
+    _clear_files(workdir)
+    return ytdlp_download(src.page_url, workdir, {"Referer": src.page_url}, tier, prog, audio, "chrome")
+
+
 def download_media(src: Source, workdir, prog, q=0, audio=False):
+    if is_ad_url(src.dl_url or "") and src.page_url and src.page_url != src.dl_url:
+        return _page_fallback_download(src, workdir, prog, q, audio)
     try:
         return _download_media(src, workdir, prog, q, audio)
     except Cancelled:
         raise
     except Exception as e:
+        if src.page_url and src.page_url != src.dl_url and not audio:
+            try:
+                _clear_files(workdir)
+                return _page_fallback_download(src, workdir, prog, q, audio)
+            except Cancelled:
+                raise
+            except Exception:
+                pass
         if not FALLBACK_PROXY or PROXY_URL or not NETERR_RE.search(str(e)):
             raise
         logging.warning("[dl] direct failed, retrying via fallback proxy")
