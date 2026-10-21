@@ -333,6 +333,13 @@ def sanitize_filename(name: str) -> str:
 
 
 SITE_SELECTORS = {
+    "pornhub.com": {
+        "download_selectors": [
+            'a[href*=".mp4"]', 'a[href*=".m3u8"]', 'a[href*="download"]',
+            'a[download]', '.downloadBtn', 'a:has-text("Download")',
+        ],
+        "title_selector": "h1.title, h1, .videoTitle, title",
+    },
     "rule34video.com": {
         "download_selectors": [
             'a[href*="/get_file/"]', 'a[href*="download"]', 'a[href*=".mp4"]',
@@ -424,9 +431,37 @@ def is_bad_url(u: str) -> bool:
     return any(b in low for b in BAD_KEYWORDS)
 
 
+AD_HOST_HINTS = (
+    "ads", "adserver", "advert", "doubleclick", "googlesyndication", "exoclick",
+    "trafficjunky", "juicyads", "adsterra", "propellerads", "clickadu", "admaven",
+    "popads", "popcash", "tsyndicate", "a-ads", "adcash", "hilltopads", "evadav",
+    "galaksion", "richads", "push.house", "adgebra", "mgid", "revcontent",
+)
+AD_PATH_HINTS = (
+    "/ads/", "/ad/", "advert", "popunder", "pop-up", "popup", "sponsor", "promo_",
+    "_promo", "campaign", "zoneid", "banner", "creative", "prebid", "vast", "vpaid",
+)
+
+
+def is_ad_url(u: str) -> bool:
+    try:
+        pr = urlparse(u)
+    except Exception:
+        return False
+    host = pr.netloc.lower()
+    path = pr.path.lower()
+    if any(h in host for h in AD_HOST_HINTS):
+        return True
+    if any(h in path for h in AD_PATH_HINTS):
+        return True
+    return path.endswith(".gif")
+
+
 def classify_media(url: str, ctype: str = "", total: int = 0):
     p = url_path(url)
     ctype = (ctype or "").lower()
+    if p.endswith(".gif") or ctype.startswith("image/"):
+        return None
     if "mp2t" in ctype or "iso.segment" in ctype:
         return None
     if p.endswith(SEGMENT_EXTS) or SEG_RE.search(p):
@@ -1379,7 +1414,7 @@ def scan_html_for_media(text, base):
     out, seen = [], set()
     for u in found:
         a = urljoin(base, u)
-        if a.startswith("http") and a not in seen and not is_bad_url(a) and not is_image_url(a):
+        if a.startswith("http") and a not in seen and not is_bad_url(a) and not is_image_url(a) and not is_ad_url(a):
             seen.add(a)
             out.append(a)
     return out
@@ -1390,11 +1425,12 @@ async def sniff_page(page_url, cookies):
     cands, seen, netlog, alt_urls = {}, set(), [], {}
     res = {
         "cands": [], "title": None, "thumbs": [], "cookies": [],
-        "html": "", "frames": [], "net": netlog, "final": "", "alt_urls": alt_urls
+        "html": "", "frames": [], "net": netlog, "final": "", "alt_urls": alt_urls,
+        "exp_dur": 0.0
     }
 
     def add(url, score, kind, size=0, tag="", q=0):
-        if not url or not url.startswith("http") or is_image_url(url) or is_bad_url(url):
+        if not url or not url.startswith("http") or is_image_url(url) or is_bad_url(url) or is_ad_url(url):
             return
         if q in STANDARD_QUALITIES and kind == "mp4":
             alt_urls.setdefault(q, url)
@@ -1549,6 +1585,17 @@ async def sniff_page(page_url, cookies):
                 await page.wait_for_timeout(900)
             await page.wait_for_timeout(500)
 
+            try:
+                dv = await page.evaluate(
+                    """()=>{const m=document.querySelector('meta[property="og:video:duration"]');
+                    if(m&&m.content)return parseFloat(m.content)||0;
+                    for(const sc of document.querySelectorAll('script[type="application/ld+json"]')){
+                    const mt=(sc.textContent||'').match(/"duration"\\s*:\\s*"?PT(?:(\\d+)H)?(?:(\\d+)M)?(?:([\\d.]+)S)?/);
+                    if(mt)return (parseInt(mt[1]||0)*3600+parseInt(mt[2]||0)*60+parseFloat(mt[3]||0))}return 0}"""
+                )
+                res["exp_dur"] = float(dv or 0)
+            except Exception:
+                pass
             try:
                 res["title"] = await page.evaluate(
                     "(sel)=>{const e=document.querySelector(sel);return (e&&e.textContent.trim())||document.title}",
@@ -1760,6 +1807,9 @@ def quick_html_probe(url, cookies):
             media.append(urljoin(url, v))
     for m in re.finditer(r'"contentUrl"\s*:\s*"([^"]+)"', un):
         media.append(urljoin(url, m.group(1)))
+    for key in ("videoUrl", "masterM3U8", "hlsUrl", "hls_url", "streamUrl", "stream_url", "mp4Url", "video_url", "playUrl"):
+        for m in re.finditer(r'"' + key + r'"\s*:\s*"(https?://[^"]+?\.(?:m3u8|mp4|webm|mpd)(?:\?[^"]*)?)"', un):
+            media.append(urljoin(url, m.group(1)))
     for m in re.finditer(r'<source[^>]+src=["\']([^"\']+)', un, re.I):
         media.append(urljoin(url, m.group(1)))
     media += scan_html_for_media(un, url)
@@ -1771,6 +1821,21 @@ def quick_html_probe(url, cookies):
     for m in re.finditer(r'"thumbnailUrl"\s*:\s*"(https?://[^"]+)"', un):
         thumbs.append(m.group(1))
     title = meta("og:title") or meta("twitter:title")
+    dur = 0.0
+    dv = meta("og:video:duration") or meta("twitter:player:stream:duration")
+    if dv:
+        try:
+            dur = float(dv)
+        except ValueError:
+            dur = 0.0
+    if not dur:
+        md = re.search(r'"duration"\s*:\s*"?PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?"?', un)
+        if md:
+            dur = (int(md.group(1) or 0) * 3600 + int(md.group(2) or 0) * 60 + float(md.group(3) or 0))
+    if not dur:
+        md = re.search(r'"duration"\s*:\s*(\d{2,6})(?:\.\d+)?\b', un)
+        if md:
+            dur = float(md.group(1))
     out, seen = [], set()
     for u in media:
         k = classify_media(u)
@@ -1778,7 +1843,7 @@ def quick_html_probe(url, cookies):
             seen.add(u)
             out.append((u, k, is_preview_url(u)))
     out.sort(key=lambda x: (x[2], x[1] != "mp4"))
-    return {"media": out, "thumbs": list(dict.fromkeys(thumbs)), "title": title or None}
+    return {"media": out, "thumbs": list(dict.fromkeys(thumbs)), "title": title or None, "dur": dur}
 
 
 async def hd_from_preview(run, preview_url, page_url, cookies, all_urls, thumbs, title):
@@ -1844,6 +1909,8 @@ async def resolve_source(url, status):
             info = await run(ffprobe, mu, make_headers(url), 25)
             if not info:
                 continue
+            if qp.get("dur") and (info.get("duration") or 0) and info["duration"] < qp["dur"] * 0.35 and len(qp["media"]) > 1:
+                continue
             if is_pv:
                 hd = await hd_from_preview(run, mu, url, cookies, [m for m, _, _ in qp["media"]], qp["thumbs"], qp["title"])
                 if hd:
@@ -1908,10 +1975,17 @@ async def resolve_source(url, status):
 
         await asyncio.gather(*[probe(c) for c in cands])
         valid = [c for c in cands if c["info"]]
-        best = (
-            max(valid, key=lambda c: (c["dur"] >= 15, c["score"], c["dur"]))
-            if valid else (cands[0] if cands[0]["score"] >= 150 else None)
-        )
+        exp_d = sn.get("exp_dur") or (generic.duration if generic else 0) or 0
+
+        def cand_key(c):
+            dur = c["dur"] or 0
+            if exp_d and dur:
+                ratio = dur / exp_d
+                close = 1.0 - min(abs(1.0 - ratio), 1.0)
+                return (0 if ratio < 0.35 else 1, close, c["score"], dur)
+            return (1, 1.0 if dur >= 60 else 0.5 if dur >= 15 else 0.0, c["score"], dur)
+
+        best = max(valid, key=cand_key) if valid else (cands[0] if cands[0]["score"] >= 150 else None)
         if best:
             if is_preview_url(best["url"]):
                 all_u = [c["url"] for c in cands] + list(alt_urls.values())
@@ -1926,6 +2000,9 @@ async def resolve_source(url, status):
                 src_b.is_preview, src_b.preview_url = True, best["url"]
             pool.append(src_b)
     if pool:
+        exp_p = (generic.duration if generic else 0) or sn.get("exp_dur") or 0
+        if exp_p:
+            return max(pool, key=lambda x: (x.duration >= exp_p * 0.5, -abs((x.duration or 0) - exp_p), len(x.quals)))
         return max(pool, key=lambda x: (x.duration >= 15, len(x.quals), x.duration))
 
     diag = {
@@ -2004,21 +2081,27 @@ def ytdlp_download(url, workdir, headers, max_h, prog, audio=False, imp="chrome"
 
 
 def ffmpeg_stream_download(url, out, headers, duration, prog, hls=False):
-    args = []
+    base = []
     if hls:
-        args += ["-allowed_extensions", "ALL"]
+        base += ["-allowed_extensions", "ALL"]
     if _http_proxy():
-        args += ["-http_proxy", _http_proxy()]
+        base += ["-http_proxy", _http_proxy()]
     if headers:
-        args += ["-headers", _hdr_str(headers)]
-    args += ["-i", url, "-c", "copy"]
-    if hls:
-        args += ["-bsf:a", "aac_adtstoasc"]
-    run_ffmpeg(
-        args + ["-movflags", "+faststart", out], duration,
-        lambda c, t: prog.update("⬇️ Downloading (Stream)", c, t, "time"),
-        stop=prog.stop
-    )
+        base += ["-headers", _hdr_str(headers)]
+    base += ["-i", url]
+    cb = lambda c, t: prog.update("⬇️ Downloading (Stream)", c, t, "time")
+    try:
+        args = base + ["-c", "copy"]
+        if hls:
+            args += ["-bsf:a", "aac_adtstoasc"]
+        run_ffmpeg(args + ["-movflags", "+faststart", out], duration, cb, stop=prog.stop)
+    except Cancelled:
+        raise
+    except Exception:
+        _rm(out)
+        args = base + ["-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast",
+                       "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k"]
+        run_ffmpeg(args + ["-movflags", "+faststart", out], duration, cb, stop=prog.stop)
     return out
 
 
