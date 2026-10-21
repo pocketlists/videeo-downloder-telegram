@@ -443,6 +443,60 @@ AD_PATH_HINTS = (
 )
 
 
+AD_BLOCK_HOSTS = {
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com", "exoclick.com",
+    "trafficjunky.com", "trafficjunky.net", "juicyads.com", "adsterra.com", "propellerads.com",
+    "clickadu.com", "admaven.com", "popads.net", "popcash.net", "hilltopads.com", "evadav.com",
+    "galaksion.com", "adcash.com", "tsyndicate.com", "a-ads.com", "mgid.com", "revcontent.com",
+    "outbrain.com", "taboola.com", "amazon-adsystem.com", "smartadserver.com", "pubmatic.com",
+    "rubiconproject.com", "openx.net", "spotxchange.com", "teads.tv", "unruly.co", "aniview.com",
+    "springserve.com", "districtm.io", "connatix.com", "playwire.com", "sovrn.com", "sharethrough.com",
+    "triplelift.com", "indexww.com", "casalemedia.com", "contextweb.com", "advertising.com",
+    "adform.net", "criteo.com", "criteo.net", "smaato.net", "bidswitch.net", "adsafeprotected.com",
+    "doubleverify.com", "moatads.com", "ads.yahoo.com", "yieldmo.com", "nativo.com", "seedtag.com",
+    "adgebra.com", "clickaine.com", "bitmedia.io", "coinzilla.com", "adnow.com", "adskeeper.com",
+    "marketgid.com", "poponclick.com", "onclickads.net", "zeropark.com", "trafficfactory.com",
+    "trafficstars.com", "exdynsrv.com", "exosrv.com", "plugrush.com", "poweredbyexoclick.com",
+}
+
+
+def adblock_hit(u: str) -> bool:
+    if is_ad_url(u):
+        return True
+    try:
+        host = urlparse(u).netloc.lower().split(":")[0]
+    except Exception:
+        return False
+    if not host:
+        return False
+    parts = host.split(".")
+    base = ".".join(parts[-2:]) if len(parts) >= 2 else host
+    if host in AD_BLOCK_HOSTS or base in AD_BLOCK_HOSTS:
+        return True
+    if parts[0] in ("ads", "ad", "adv", "advert", "adserver") or parts[0].startswith("ads-") or parts[0].startswith("ad-"):
+        return True
+    return False
+
+
+AD_TOKENS = {
+    "ad", "ads", "adv", "advert", "adverts", "promo", "promos", "sponsor", "sponsored",
+    "banner", "banners", "popunder", "popup", "preroll", "midroll", "postroll", "adroll",
+    "vast", "vpaid", "ima", "pubads", "gampad", "pagead", "syndication", "adbreak",
+    "adserver", "adsense", "adtech", "creative", "campaign", "click", "tracker", "tracking",
+}
+
+
+def cand_sort_key(c, exp_d=0):
+    dur = c.get("dur") or 0
+    master = 1 if c.get("tag") in ("HLSM", "MAIN") or c.get("kind") == "dash" else 0
+    if exp_d and dur:
+        ratio = dur / exp_d
+        close = 1.0 - min(abs(1.0 - ratio), 1.0)
+        return (0 if ratio < 0.35 else 1, master, close, dur, c.get("score") or 0)
+    bucket = 1.0 if dur >= 120 else 0.8 if dur >= 45 else 0.5 if dur >= 15 else 0.2
+    return (master, bucket, dur, c.get("score") or 0)
+
+
 def is_ad_url(u: str) -> bool:
     try:
         pr = urlparse(u)
@@ -454,7 +508,10 @@ def is_ad_url(u: str) -> bool:
         return True
     if any(h in path for h in AD_PATH_HINTS):
         return True
-    return path.endswith(".gif")
+    if path.endswith(".gif"):
+        return True
+    toks = set(re.split(r"[^a-z0-9]+", host + path))
+    return bool(toks & AD_TOKENS)
 
 
 def classify_media(url: str, ctype: str = "", total: int = 0):
@@ -1426,7 +1483,7 @@ async def sniff_page(page_url, cookies):
     res = {
         "cands": [], "title": None, "thumbs": [], "cookies": [],
         "html": "", "frames": [], "net": netlog, "final": "", "alt_urls": alt_urls,
-        "exp_dur": 0.0
+        "exp_dur": 0.0, "blocked": 0
     }
 
     def add(url, score, kind, size=0, tag="", q=0):
@@ -1481,11 +1538,13 @@ async def sniff_page(page_url, cookies):
                 return
             path = url_path(url)
             score = 0
+            tag = "NET"
             if kind == "hls":
                 score = 160
                 try:
                     if total < 3 * MiB and "#EXT-X-STREAM-INF" in (await resp.text()):
                         score = 320
+                        tag = "HLSM"
                 except Exception:
                     pass
             elif kind == "dash":
@@ -1502,7 +1561,7 @@ async def sniff_page(page_url, cookies):
             score += 110 if qn >= 1080 else 75 if qn == 720 else 35 if qn == 480 else 0
             if is_preview_url(url):
                 score -= 80
-            add(url, score, kind, total, "NET", qn)
+            add(url, score, kind, total, tag, qn)
         except Exception:
             pass
 
@@ -1533,6 +1592,9 @@ async def sniff_page(page_url, cookies):
 
             async def route(r):
                 if r.request.resource_type in ("font",):
+                    await r.abort()
+                elif adblock_hit(r.request.url):
+                    res["blocked"] += 1
                     await r.abort()
                 else:
                     await r.continue_()
@@ -1668,6 +1730,19 @@ async def sniff_page(page_url, cookies):
                 await page.wait_for_timeout(500)
 
             await collect_links()
+            try:
+                mains = await page.evaluate(
+                    """()=>{const out=[];document.querySelectorAll('video').forEach(v=>{
+                    const r=v.getBoundingClientRect();const u=v.currentSrc||v.src;
+                    if(u&&u.startsWith('http')&&r.width>=200&&r.height>=120)
+                    out.push({u,d:v.duration||0,a:r.width*r.height})});return out}"""
+                )
+                for m in mains or []:
+                    add(m["u"], 600, classify_media(m["u"]) or "mp4", 0, "MAIN")
+                    if m.get("d") and not res["exp_dur"]:
+                        res["exp_dur"] = float(m["d"])
+            except Exception:
+                pass
             for fr in page.frames:
                 try:
                     content = await fr.content()
@@ -1859,7 +1934,7 @@ def quick_html_probe(url, cookies):
         if u.startswith("http") and u not in seen and k and not is_hard_bad_url(u) and not is_ad_url(u):
             seen.add(u)
             out.append((u, k, is_preview_url(u)))
-    out.sort(key=lambda x: (x[2], x[1] != "mp4"))
+    out.sort(key=lambda x: (x[2], 0 if x[1] == "hls" else 1, x[1] != "mp4"))
     return {"media": out, "thumbs": list(dict.fromkeys(thumbs)), "title": title or None, "dur": dur}
 
 
@@ -1922,12 +1997,16 @@ async def resolve_source(url, status):
     except Exception:
         qp = None
     if qp and qp["media"]:
-        for mu, kind, is_pv in qp["media"][:4]:
+        probed_q = []
+        for mu, kind, is_pv in qp["media"][:8]:
             info = await run(ffprobe, mu, make_headers(url), 25)
             if not info:
                 continue
             if qp.get("dur") and (info.get("duration") or 0) and info["duration"] < qp["dur"] * 0.35 and len(qp["media"]) > 1:
                 continue
+            probed_q.append((info.get("duration") or 0, mu, is_pv, info))
+        probed_q.sort(key=lambda x: -x[0])
+        for _qd, mu, is_pv, info in probed_q:
             if is_pv:
                 hd = await hd_from_preview(run, mu, url, cookies, [m for m, _, _ in qp["media"]], qp["thumbs"], qp["title"])
                 if hd:
@@ -1989,18 +2068,21 @@ async def resolve_source(url, status):
                 h["Cookie"] = ch
             c["info"] = await run(ffprobe, c["url"], h, 25)
             c["dur"] = (c["info"] or {}).get("duration") or 0
+            if not c["info"] and c["kind"] in ("hls", "dash"):
+                try:
+                    yi = await run(ytdlp_extract, c["url"], h)
+                except Exception:
+                    yi = None
+                if yi:
+                    c["dur"] = float(yi.get("duration") or 0) or c["dur"]
+                    if c["dur"]:
+                        c["info"] = {"duration": c["dur"], "short": 0, "size": 0}
 
         await asyncio.gather(*[probe(c) for c in cands])
         valid = [c for c in cands if c["info"]]
         exp_d = sn.get("exp_dur") or (generic.duration if generic else 0) or 0
 
-        def cand_key(c):
-            dur = c["dur"] or 0
-            if exp_d and dur:
-                ratio = dur / exp_d
-                close = 1.0 - min(abs(1.0 - ratio), 1.0)
-                return (0 if ratio < 0.35 else 1, close, c["score"], dur)
-            return (1, 1.0 if dur >= 60 else 0.5 if dur >= 15 else 0.0, c["score"], dur)
+        cand_key = lambda c: cand_sort_key(c, exp_d)
 
         best = max(valid, key=cand_key) if valid else (cands[0] if cands[0]["score"] >= 150 else None)
         if best:
@@ -2260,6 +2342,131 @@ def _page_fallback_download(src: Source, workdir, prog, q=0, audio=False):
     return ytdlp_download(src.page_url, workdir, {"Referer": src.page_url}, tier, prog, audio, "chrome")
 
 
+LIST_SKIP = (
+    "login", "signup", "sign-up", "upload", "categories", "category", "channels", "channel/",
+    "pornstars", "models", "tags", "/tag/", "members", "community", "albums", "playlists",
+    "/user", "search", "blog", "news", "premium", "support", "terms", "privacy", "dmca",
+    "contact", "about", "logout", "register", "forgot", "settings", "profile", "inbox",
+)
+
+
+def _video_page_hint(href: str, page_host: str) -> bool:
+    try:
+        pr = urlparse(href)
+    except Exception:
+        return False
+    if pr.netloc and page_host and pr.netloc.split(":")[0].lower() != page_host:
+        return False
+    path = (pr.path or "").lower()
+    if any(x in path for x in LIST_SKIP):
+        return False
+    low = path + "?" + (pr.query or "").lower()
+    if any(h in low for h in ("/video", "viewkey", "/watch", "/v/", "/vid", "videos/")):
+        return True
+    return bool(re.search(r"/[a-z0-9][a-z0-9\-_]{5,}$", path) and re.search(r"\d", path))
+
+
+def _img_thumb_from_tag(tag: str):
+    for attr in ("data-src", "data-thumb-url", "data-original", "data-lazy-src", "data-image"):
+        m = re.search(attr + r'=["\']([^"\']+)', tag, re.I)
+        if m and not m.group(1).startswith("data:"):
+            return m.group(1)
+    m = re.search(r'srcset=["\']([^"\',\s]+)', tag, re.I)
+    if m and not m.group(1).startswith("data:"):
+        return m.group(1)
+    m = re.search(r'src=["\']([^"\']+)', tag, re.I)
+    if m:
+        u = m.group(1)
+        low = u.lower()
+        if not u.startswith("data:") and not any(x in low for x in ("blank", "spinner", "lazy", "placeholder", "1x1", ".svg")):
+            return u
+    return None
+
+
+def scan_listing(url, limit=80):
+    entries, seen = [], set()
+    page_host = urlparse(url).netloc.split(":")[0].lower()
+
+    def add(page, title, thumb):
+        if not page or not thumb:
+            return
+        page = urljoin(url, html.unescape(str(page)))
+        thumb = urljoin(url, html.unescape(str(thumb)))
+        if not page.startswith("http") or not thumb.startswith("http"):
+            return
+        if page in seen or is_ad_url(page) or is_ad_url(thumb) or is_bad_url(page):
+            return
+        if not _video_page_hint(page, page_host):
+            return
+        seen.add(page)
+        entries.append({"page": page, "title": (str(title or "").strip() or "Video")[:120], "thumb": thumb})
+
+    try:
+        import yt_dlp
+        opts = {
+            "quiet": True, "no_warnings": True, "skip_download": True,
+            "extract_flat": "in_playlist", "playlistend": limit,
+            "socket_timeout": 20, "retries": 1,
+        }
+        if cookies_ok():
+            opts["cookiefile"] = COOKIES_FILE
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        for e in (info or {}).get("entries") or []:
+            if not isinstance(e, dict):
+                continue
+            thumb = e.get("thumbnail")
+            if not thumb and e.get("thumbnails"):
+                thumb = e["thumbnails"][-1].get("url")
+            add(e.get("webpage_url") or e.get("url"), e.get("title"), thumb)
+    except Exception:
+        pass
+    if len(entries) < 3:
+        try:
+            sc = make_session(make_headers(url), load_cookie_list())
+            r = sc.get(url, timeout=30)
+            text = r.text or ""
+            for m in re.finditer(r'<a\b[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', text, re.I | re.S):
+                href, inner = m.group(1), m.group(2)
+                im = re.search(r"<img\b[^>]*>", inner, re.I)
+                if not im:
+                    continue
+                thumb = _img_thumb_from_tag(im.group(0))
+                if not thumb:
+                    continue
+                tm = re.search(r'alt=["\']([^"\']+)', im.group(0), re.I)
+                title = tm.group(1) if tm else re.sub(r"<[^>]+>", " ", inner).strip()
+                add(href, title, thumb)
+                if len(entries) >= limit:
+                    break
+        except Exception:
+            pass
+    return entries[:limit]
+
+
+def rank_listing_matches(entries, preview_hashes, base_url):
+    from modules.smart_tools import ahash_bytes, hash_sim
+    if not preview_hashes:
+        return []
+    sc = make_session(make_headers(base_url), load_cookie_list())
+    scored = []
+    for e in entries:
+        try:
+            r = sc.get(e["thumb"], timeout=15)
+            data = r.content if r is not None else b""
+        except Exception:
+            continue
+        if not data or len(data) > 4 * MiB:
+            continue
+        h = ahash_bytes(data)
+        if h is None:
+            continue
+        score = max(hash_sim(h, ph) for ph in preview_hashes)
+        scored.append({**e, "score": round(float(score), 3)})
+    scored.sort(key=lambda x: -x["score"])
+    return scored
+
+
 def download_media(src: Source, workdir, prog, q=0, audio=False):
     if is_ad_url(src.dl_url or "") and src.page_url and src.page_url != src.dl_url:
         return _page_fallback_download(src, workdir, prog, q, audio)
@@ -2418,6 +2625,14 @@ async def run_smart_clip(client, job: Job, kind: str):
     msg = job.msg
     label = "🎬 10s Preview" if kind == "preview" else "🔥 Smart Highlight"
     prog = Progress(loop, msg, f"{label}: <b>{esc(job.src.title[:55])}</b>", stop_event(job.chat_id))
+    if job.src.is_preview:
+        try:
+            await prog.stage("🔎 Source preview clip hai — pehle FULL video le raha hoon…")
+            full = await asyncio.wait_for(resolve_source(job.src.page_url, prog.stage), timeout=240)
+            if full and (full.duration or 0) >= (job.src.duration or 0):
+                job.src = full
+        except Exception:
+            pass
     workdir = os.path.join(DOWNLOAD_DIR, f"sc_{job.id}_{int(time.time())}")
     os.makedirs(workdir, exist_ok=True)
     try:
