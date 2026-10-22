@@ -327,6 +327,31 @@ def _job_id(chat_id):
     return f"{chat_id}_{int(time.time()) % 100000}"
 
 
+async def _present_series(client, chat_id, url, st):
+    loop = asyncio.get_running_loop()
+    try:
+        series = await loop.run_in_executor(None, parse_series, url, None)
+    except Exception as e:
+        await st.edit_text(f"❌ Parse fail: <code>{str(e)[:200]}</code>")
+        return False
+    if not series["chapters"]:
+        await st.edit_text(
+            "❌ Is page par chapters nahi mile.\nSeries ke <b>main page</b> ka link bhejo (chapter ka nahi), "
+            "aur site par chapter list khuli honi chahiye."
+        )
+        return False
+    jid = _job_id(chat_id)
+    JOBS[jid] = {"series": series, "chat_id": chat_id, "busy": False, "msg": st}
+    chs = series["chapters"]
+    await st.edit_text(
+        f"📚 <b>{series['title']}</b>\n\n"
+        f"📖 Chapters: <b>{len(chs)}</b> (Ch {chs[0]['num']:g} → Ch {chs[-1]['num']:g})\n\n"
+        "Kitne chapters download karun?",
+        reply_markup=range_keyboard(jid),
+    )
+    return True
+
+
 async def manga_command(client, message):
     parts = (message.text or "").split(maxsplit=1)
     url = ""
@@ -340,28 +365,37 @@ async def manga_command(client, message):
         return await message.reply_text(
             "📚 <b>Manga / Manhwa Downloader</b>\n\nSeries ka link bhejo:\n"
             "<code>/manga https://site.com/manga/series-name</code>\n\n"
+            "Ya bas series ka link hi bhej do — bot khud pehchan lega.\n"
             "Phir chapters choose karke <b>ZIP</b> me organized images milengi.",
         )
     st = await message.reply_text("🔎 Series parse kar raha hoon…")
-    loop = asyncio.get_running_loop()
-    try:
-        series = await loop.run_in_executor(None, parse_series, url, None)
-    except Exception as e:
-        return await st.edit_text(f"❌ Parse fail: <code>{str(e)[:200]}</code>")
-    if not series["chapters"]:
-        return await st.edit_text(
-            "❌ Is page par chapters nahi mile.\nSeries ke <b>main page</b> ka link bhejo (chapter ka nahi), "
-            "aur site par chapter list khuli honi chahiye."
-        )
-    jid = _job_id(message.chat.id)
-    JOBS[jid] = {"series": series, "chat_id": message.chat.id, "busy": False, "msg": st}
-    chs = series["chapters"]
-    await st.edit_text(
-        f"📚 <b>{series['title']}</b>\n\n"
-        f"📖 Chapters: <b>{len(chs)}</b> (Ch {chs[0]['num']:g} → Ch {chs[-1]['num']:g})\n\n"
-        "Kitne chapters download karun?",
-        reply_markup=range_keyboard(jid),
-    )
+    await _present_series(client, message.chat.id, url, st)
+
+
+MANGA_HINT = re.compile(
+    r"/(manga|manhwa|manhua|comic|comics|series|webtoon|title|toon|read|book)/[^/]*", re.I)
+
+
+async def try_auto_manga(client, message):
+    text = message.text or message.caption or ""
+    m = re.search(r"https?://[^\s]+", text)
+    if not m:
+        return False
+    url = m.group(0)
+    path = urlparse(url).path or ""
+    if not MANGA_HINT.search(path):
+        return False
+    if re.search(r"chapter[-_]?\d|/ch[-_]?\d", path, re.I):
+        return False
+    st = await message.reply_text("📚 Ye manga/manhwa series lagti hai — chapters nikaal raha hoon…")
+    ok = await _present_series(client, message.chat.id, url, st)
+    if not ok:
+        try:
+            await st.edit_text("📚 Is series me chapters nahi mile — video ki tarah try karta hoon…")
+        except Exception:
+            pass
+        return False
+    return True
 
 
 async def manga_callback(client, cq, parts):
