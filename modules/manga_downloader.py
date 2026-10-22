@@ -10,7 +10,9 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlparse
 
-from modules.video_engine import make_headers, make_session, sanitize_filename, humanbytes, spawn
+import requests as _rq
+
+from modules.video_engine import UA, _proxy, make_headers, make_session, sanitize_filename, humanbytes, spawn
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp")
 BAD_TOKENS = ("logo", "avatar", "banner", "favicon", "placeholder", "spinner",
@@ -24,14 +26,44 @@ RANGE_WAIT = {}
 _tls = threading.local()
 
 
-def _session(referer=None, cookies=None):
-    if getattr(_tls, "sess", None) is None or getattr(_tls, "ref", None) != referer:
-        _tls.sess = make_session(make_headers(referer), cookies or [])
-        _tls.ref = referer
-    return _tls.sess
+def _plain_session(referer=None, cookies=None):
+    s = _rq.Session()
+    s.headers.update({"User-Agent": UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"})
+    if referer:
+        s.headers["Referer"] = referer
+    if _proxy():
+        s.proxies = {"http": _proxy(), "https": _proxy()}
+    for c in cookies or []:
+        try:
+            s.cookies.set(c["name"], c["value"], domain=c.get("domain") or None, path=c.get("path") or "/")
+        except Exception:
+            pass
+    return s
+
+
+def _session(referer=None, cookies=None, kind="plain"):
+    key = (referer, kind)
+    store = getattr(_tls, "store", None)
+    if store is None:
+        store = _tls.store = {}
+    if key not in store:
+        store[key] = (_plain_session(referer, cookies) if kind == "plain"
+                      else make_session(make_headers(referer), cookies or []))
+    return store[key]
 
 
 def _fetch(url, cookies=None, timeout=30, post_data=None):
+    try:
+        sc = _plain_session(url, cookies)
+        if post_data is not None:
+            r = sc.post(url, data=post_data, timeout=timeout)
+        else:
+            r = sc.get(url, timeout=timeout)
+        txt = r.text or ""
+        if r.status_code < 400 and "just a moment" not in txt[:3000].lower():
+            return txt
+    except Exception:
+        pass
     sc = make_session(make_headers(url), cookies or [])
     if post_data is not None:
         r = sc.post(url, data=post_data, timeout=timeout)
@@ -141,7 +173,47 @@ def _img_ok(u):
     if any(t in low for t in BAD_TOKENS):
         return False
     path = urlparse(u).path.lower()
+    if path.endswith(".svg") or "/icon" in path:
+        return False
     return path.endswith(IMG_EXTS) or "cdn" in low or "/uploads/" in low or "/images/" in low or "/image/" in low
+
+
+def _img_from_tag(tag, base):
+    cand = None
+    for attr in ("data-src", "data-lazy-src", "data-original", "data-url", "src"):
+        am = re.search(attr + r'=["\']([^"\']+)["\']', tag, re.I)
+        if am and not am.group(1).startswith("data:"):
+            cand = am.group(1)
+            break
+    if not cand:
+        sm = re.search(r'srcset=["\']([^"\']+)["\']', tag, re.I)
+        if sm:
+            parts = [p.strip().split(" ")[0] for p in sm.group(1).split(",") if p.strip()]
+            cand = parts[-1] if parts else None
+    if cand:
+        u = urljoin(base, cand.strip())
+        if _img_ok(u):
+            return u
+    return None
+
+
+def _reader_images(un, base):
+    out = []
+    for m in re.finditer(r'<div[^>]*class="[^"]*page-break[^"]*"[^>]*>(.*?)</div>', un, re.I | re.S):
+        im = re.search(r"<img\b[^>]*>", m.group(1), re.I)
+        if im:
+            u = _img_from_tag(im.group(0), base)
+            if u:
+                out.append(u)
+    if len(out) >= 2:
+        return list(dict.fromkeys(out))
+    i = un.find("reading-content")
+    if i >= 0:
+        for m in re.finditer(r"<img\b[^>]*>", un[i:], re.I):
+            u = _img_from_tag(m.group(0), base)
+            if u:
+                out.append(u)
+    return list(dict.fromkeys(out))
 
 
 def _walk_json(obj, out):
@@ -156,30 +228,32 @@ def _walk_json(obj, out):
             _walk_json(v, out)
 
 
+def _dominant_filter(imgs):
+    if len(imgs) < 8:
+        return imgs
+    from collections import Counter
+    def key(u):
+        segs = [x for x in urlparse(u).path.split("/") if x]
+        return "/".join(segs[:2])
+    top, n = Counter(key(u) for u in imgs).most_common(1)[0]
+    if n >= 0.7 * len(imgs):
+        return [u for u in imgs if key(u) == top]
+    return imgs
+
+
 def chapter_images(chapter_url, cookies=None):
     txt = _fetch(chapter_url, cookies)
     if not txt:
         return []
     un = ihtml.unescape(txt.replace("\\/", "/").replace("\\u0026", "&"))
-    dom = []
-    for m in re.finditer(r"<img\b[^>]*>", un, re.I):
-        tag = m.group(0)
-        cand = None
-        for attr in ("data-src", "data-lazy-src", "data-original", "data-url", "src"):
-            am = re.search(attr + r'=["\']([^"\']+)["\']', tag, re.I)
-            if am and not am.group(1).startswith("data:"):
-                cand = am.group(1)
-                break
-        if not cand:
-            sm = re.search(r'srcset=["\']([^"\']+)["\']', tag, re.I)
-            if sm:
-                parts = [p.strip().split(" ")[0] for p in sm.group(1).split(",") if p.strip()]
-                cand = parts[-1] if parts else None
-        if cand:
-            u = urljoin(chapter_url, cand.strip())
-            if _img_ok(u):
-                dom.append(u)
-    dom = list(dict.fromkeys(dom))
+    dom = _reader_images(un, chapter_url)
+    if len(dom) < 2:
+        all_dom = []
+        for m in re.finditer(r"<img\b[^>]*>", un, re.I):
+            u = _img_from_tag(m.group(0), chapter_url)
+            if u:
+                all_dom.append(u)
+        dom = list(dict.fromkeys(all_dom))
     script_urls = []
     m = re.search(r"ts_reader\.run\((\{.*?\})\)\s*;", un, re.S)
     if m:
@@ -203,9 +277,11 @@ def chapter_images(chapter_url, cookies=None):
             if _img_ok(u):
                 script_urls.append(u)
         script_urls = list(dict.fromkeys(script_urls))
-    if len(script_urls) > len(dom) * 1.5 and len(script_urls) >= 3:
-        return script_urls[:MAX_PAGES_PER_CHAPTER]
-    return (dom or script_urls)[:MAX_PAGES_PER_CHAPTER]
+    if len(dom) >= 3:
+        return _dominant_filter(dom)[:MAX_PAGES_PER_CHAPTER]
+    if script_urls:
+        return _dominant_filter(script_urls)[:MAX_PAGES_PER_CHAPTER]
+    return _dominant_filter(dom)[:MAX_PAGES_PER_CHAPTER]
 
 
 def _ext_from_bytes(data):
@@ -224,22 +300,25 @@ def _ext_from_bytes(data):
 
 def _download_one(args):
     idx, u, chapter_url, folder, width, cookies = args
-    sess = _session(chapter_url, cookies)
+    pr = urlparse(chapter_url)
+    refs = [chapter_url, f"{pr.scheme}://{pr.netloc}/", None]
     last = None
-    for _try in range(3):
-        try:
-            r = sess.get(u, headers={"Referer": chapter_url}, timeout=40)
-            data = r.content or b""
-            ext = _ext_from_bytes(data)
-            if ext and len(data) > 2500:
-                path = os.path.join(folder, f"{idx:0{width}d}{ext}")
-                with open(path, "wb") as f:
-                    f.write(data)
-                return idx, path, len(data)
-            last = f"bad image ({len(data)}b)"
-        except Exception as e:
-            last = str(e)[:80]
-        time.sleep(1.0)
+    for kind in ("plain", "scraper"):
+        sess = _session(chapter_url if kind == "scraper" else None, cookies, kind)
+        for ref in refs:
+            try:
+                r = sess.get(u, headers={"Referer": ref} if ref else {}, timeout=40)
+                data = r.content or b""
+                ext = _ext_from_bytes(data)
+                if ext and len(data) > 2500:
+                    path = os.path.join(folder, f"p{idx:04d}{ext}")
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    return idx, path, len(data)
+                last = f"bad image ({len(data)}b)"
+            except Exception as e:
+                last = str(e)[:80]
+            time.sleep(0.4)
     return idx, None, last
 
 
@@ -251,17 +330,23 @@ def download_chapter(chapter, dest_root, cookies=None, progress=None):
     os.makedirs(folder, exist_ok=True)
     width = max(3, len(str(len(imgs))))
     jobs = [(i + 1, u, chapter["url"], folder, width, cookies) for i, u in enumerate(imgs)]
-    ok, total = 0, 0
+    total = 0
+    got = []
     with ThreadPoolExecutor(max_workers=8) as ex:
         for idx, path, res in ex.map(_download_one, jobs):
             if path:
-                ok += 1
+                got.append((idx, path))
                 total += res
             if progress:
                 progress(idx, len(imgs))
-    if ok == 0:
+    if not got:
         return None, 0, 0, "saari images fail ho gayin"
-    return folder, ok, total, ""
+    got.sort()
+    width = max(3, len(str(len(got))))
+    for n, (_idx, path) in enumerate(got, 1):
+        ext = os.path.splitext(path)[1]
+        os.replace(path, os.path.join(folder, f"{n:0{width}d}{ext}"))
+    return folder, len(got), total, ""
 
 
 def build_zip(series_title, chapter_folders, out_path):
@@ -369,7 +454,24 @@ async def manga_command(client, message):
             "Phir chapters choose karke <b>ZIP</b> me organized images milengi.",
         )
     st = await message.reply_text("🔎 Series parse kar raha hoon…")
+    su = series_url_from_chapter(url)
+    if su and await _present_series(client, message.chat.id, su, st):
+        return
     await _present_series(client, message.chat.id, url, st)
+
+
+def series_url_from_chapter(url):
+    pr = urlparse(url)
+    segs = [x for x in (pr.path or "").split("/") if x]
+    for i, seg in enumerate(segs):
+        low = seg.lower()
+        if (re.fullmatch(r"chapter[-_]?\d+(\.\d+)?", low) or re.fullmatch(r"ch[-_]?\d+(\.\d+)?", low)
+                or re.fullmatch(r"episode[-_]?\d+(\.\d+)?", low) or low.startswith("chapter-")
+                or low in ("chapter", "ch") and i == len(segs) - 2):
+            if i >= 1:
+                from urllib.parse import urlunparse
+                return urlunparse(pr._replace(path="/" + "/".join(segs[:i]) + "/", query="", fragment=""))
+    return ""
 
 
 MANGA_HINT = re.compile(
@@ -383,9 +485,19 @@ async def try_auto_manga(client, message):
         return False
     url = m.group(0)
     path = urlparse(url).path or ""
-    if not MANGA_HINT.search(path):
+    su = series_url_from_chapter(url)
+    if su:
+        st = await message.reply_text("📚 Chapter link mila — is series ke saare chapters nikaal raha hoon…")
+        if await _present_series(client, message.chat.id, su, st):
+            return True
+        if await _present_series(client, message.chat.id, url, st):
+            return True
+        try:
+            await st.edit_text("📚 Is series me chapters nahi mile — video ki tarah try karta hoon…")
+        except Exception:
+            pass
         return False
-    if re.search(r"chapter[-_]?\d|/ch[-_]?\d", path, re.I):
+    if not MANGA_HINT.search(path):
         return False
     st = await message.reply_text("📚 Ye manga/manhwa series lagti hai — chapters nikaal raha hoon…")
     ok = await _present_series(client, message.chat.id, url, st)
