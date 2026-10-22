@@ -720,6 +720,8 @@ async def router(client, message: Message):
             return _enqueue(message.chat.id, ("album", message))
         if CANCEL_RE.match(text) and not media_of(message)[0] and not extract_urls(message):
             return await do_cancel(client, message)
+        if not media_of(message)[0] and extract_urls(message) and await mg.try_auto_manga(client, message):
+            return
         await intake(message)
     except Exception as e:
         logging.exception("router failed")
