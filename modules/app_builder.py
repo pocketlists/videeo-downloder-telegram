@@ -7,8 +7,15 @@ buttons (naam / package id) -> Gradle build -> APK wapas.
 GitHub Actions ke ubuntu runner par JDK aur Android SDK pehle se hote hain;
 jahan kuch missing ho (gradle wrapper jar, SDK platform, debug keystore)
 wahi cheez yahin bana/download kar li jati hai.
+
+FIX (v2): Package ID badalne par google-services.json me us package ka client
+nahi hota tha -> ":app:processDebugGoogleServices FAILED - No matching client
+found for package name ...". Ab build se pehle google-services.json me final
+package ke liye client entry automatically add/patch ho jati hai.
 """
 import asyncio
+import copy
+import json
 import os
 import re
 import shutil
@@ -52,8 +59,9 @@ def esc(t):
 
 def _sh(cmd, timeout=120, cwd=None, env=None):
     try:
+        # string command (pipe/redirect wali) ko shell se chalao, list ko seedha
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           cwd=cwd, env=env)
+                           cwd=cwd, env=env, shell=isinstance(cmd, str))
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except Exception as e:
         return 1, str(e)
@@ -93,21 +101,33 @@ def _app_gradle(root):
 
 
 def _project_info(root):
-    info = {"name": "App", "pkg": "", "sdk": 34, "gradle": ""}
+    info = {"name": "App", "pkg": "", "sdk": 34, "gradle": "", "suffixes": []}
     gp = _app_gradle(root)
     if gp:
         t = _read(gp)
         m = re.search(r'applicationId\s*=?\s*"([^"]+)"', t)
         if m:
             info["pkg"] = m.group(1)
-        m = re.search(r"compileSdk\s*(?:=\s*|version\s*=\s*release\()\s*(\d+)", t)
+        # compileSdk = 34 | compileSdk 34 | compileSdkVersion 34
+        # compileSdk { version = release(36) { minorApiLevel = 1 } }
+        m = (re.search(r"compileSdk(?:Version)?\s*=?\s*(\d+)", t)
+             or re.search(r"compileSdk\s*\{[^}]*?release\(\s*(\d+)\s*\)", t, re.S)
+             or re.search(r"compileSdk\s*\{[^}]*?version\s*=\s*(\d+)", t, re.S))
         if m:
             info["sdk"] = int(m.group(1))
+        info["suffixes"] = re.findall(r'applicationIdSuffix\s*=?\s*"([^"]+)"', t)
     for cand in ("app/src/main/res/values/strings.xml",):
         t = _read(os.path.join(root, cand))
         m = re.search(r'<string name="app_name">([^<]+)</string>', t)
         if m:
             info["name"] = m.group(1).strip()
+    if info["name"] == "App":
+        # strings.xml na ho to settings.gradle ke rootProject.name se naam lo
+        for sn in ("settings.gradle.kts", "settings.gradle"):
+            m = re.search(r'rootProject\.name\s*=\s*["\']([^"\']+)["\']', _read(os.path.join(root, sn)))
+            if m:
+                info["name"] = m.group(1).strip()
+                break
     wp = _read(os.path.join(root, "gradle/wrapper/gradle-wrapper.properties"))
     m = re.search(r"gradle-([\d.]+)-(?:bin|all)\.zip", wp)
     if m:
@@ -159,8 +179,9 @@ def _ensure_sdk_packages(sdk, compile_sdk, env, log):
         return
     log.append(f"SDK platform android-{compile_sdk} install ho raha hai…")
     _sh(f"yes | '{sm}' --sdk_root='{sdk}' --licenses >/dev/null 2>&1", timeout=180, env=env)
-    _sh([sm, f"--sdk_root={sdk}", f"platforms;android-{compile_sdk}",
-         f"build-tools;{compile_sdk}.0.0"], timeout=600, env=env)
+    _sh([sm, f"--sdk_root={sdk}", f"platforms;android-{compile_sdk}"], timeout=600, env=env)
+    # build-tools alag se - fail ho to bhi platform install ka nuksan nahi
+    _sh([sm, f"--sdk_root={sdk}", f"build-tools;{compile_sdk}.0.0"], timeout=600, env=env)
 
 
 def _gradle_cmd(root, info, env, log):
@@ -201,6 +222,55 @@ def _gradle_cmd(root, info, env, log):
     return [exe]
 
 
+def _fix_google_services(root, pkgs, log):
+    """google-services.json me har zaroori package ke liye client entry pakki karo.
+
+    Package ID badalne par plugin 'No matching client found for package name'
+    se build tod deta hai. Yahan pehle client ko clone karke naye package ke
+    saath add kar dete hain (purani entry bhi rahti hai).
+    """
+    pkgs = [p for p in dict.fromkeys(pkgs) if p]
+    if not pkgs:
+        return
+    skip = {"build", ".git", "node_modules", ".gradle"}
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        if "google-services.json" not in files:
+            continue
+        path = os.path.join(dirpath, "google-services.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            log.append(f"google-services.json padh nahi paya: {str(e)[:80]}")
+            continue
+        clients = data.get("client") or []
+        if not clients:
+            continue
+
+        def cpkg(c):
+            return (((c.get("client_info") or {}).get("android_client_info") or {})
+                    .get("package_name"))
+
+        have = {cpkg(c) for c in clients}
+        added = []
+        for p in pkgs:
+            if p in have:
+                continue
+            new = copy.deepcopy(clients[0])
+            new.setdefault("client_info", {}).setdefault("android_client_info", {})["package_name"] = p
+            for oc in new.get("oauth_client") or []:
+                if isinstance(oc.get("android_info"), dict):
+                    oc["android_info"]["package_name"] = p
+            clients.append(new)
+            added.append(p)
+        if added:
+            data["client"] = clients
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            log.append("google-services.json fix: " + ", ".join(added))
+
+
 def _apply_customizations(root, info, cust, log):
     gp = _app_gradle(root)
     if gp:
@@ -222,7 +292,7 @@ def _apply_customizations(root, info, cust, log):
         t = _read(sp)
         if t and 'name="app_name"' in t:
             t2 = re.sub(r'(<string name="app_name">)[^<]*(</string>)',
-                        rf"\g<1>{cust['name']}\g<2>", t)
+                        lambda m: m.group(1) + cust["name"] + m.group(2), t)
             if t2 != t:
                 with open(sp, "w", encoding="utf-8") as f:
                     f.write(t2)
@@ -230,10 +300,18 @@ def _apply_customizations(root, info, cust, log):
         man = os.path.join(root, "app/src/main/AndroidManifest.xml")
         tm = _read(man)
         if tm and 'android:label="' in tm and "@string/app_name" not in tm:
-            tm2 = re.sub(r'android:label="[^"]*"', f'android:label="{cust["name"]}"', tm, count=1)
+            tm2 = re.sub(r'android:label="[^"]*"',
+                         lambda m: f'android:label="{cust["name"]}"', tm, count=1)
             if tm2 != tm:
                 with open(man, "w", encoding="utf-8") as f:
                     f.write(tm2)
+    # --- FIX: final package ke liye google-services.json match karao ---
+    try:
+        fin = _project_info(root)
+        pkgs = [fin["pkg"]] + [fin["pkg"] + s for s in fin.get("suffixes", []) if fin["pkg"]]
+        _fix_google_services(root, pkgs, log)
+    except Exception as e:
+        log.append(f"google-services note: {str(e)[:100]}")
     rm = os.path.join(root, "README.md")
     t = _read(rm)
     if t and ("ai.google.dev" in t or "AI Studio" in t):
@@ -260,11 +338,12 @@ def _prep_project(root, info, env, log):
     if m and m.group(1).endswith((".keystore", ".jks")) and "debug" in m.group(1).lower():
         ks = os.path.join(root, m.group(1))
         if not os.path.exists(ks):
-            keytool = os.path.join(env.get("JAVA_HOME", ""), "bin", "keytool") or "keytool"
+            jh = env.get("JAVA_HOME", "")
+            keytool = os.path.join(jh, "bin", "keytool") if jh else "keytool"
             rc, _ = _sh([keytool, "-genkeypair", "-v", "-keystore", ks,
                          "-alias", "androiddebugkey", "-keyalg", "RSA", "-keysize", "2048",
                          "-validity", "10000", "-storepass", "android", "-keypass", "android",
-                         "-dname", "CN=Android Debug,O=Android,C=US"], timeout=60)
+                         "-dname", "CN=Android Debug,O=Android,C=US"], timeout=60, env=env)
             if rc == 0:
                 log.append("Debug keystore banaya (missing tha)")
     if os.path.exists(os.path.join(root, ".env.example")) and not os.path.exists(os.path.join(root, ".env")):
@@ -322,6 +401,10 @@ async def _run_build(client, chat_id, status, sess):
                     proc.kill()
                 except Exception:
                     pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
                 break
             tail = _read(logpath)
             lines = [ln for ln in tail.splitlines() if ln.strip().startswith("> Task")][-1:]
@@ -345,8 +428,9 @@ async def _run_build(client, chat_id, status, sess):
         name = sess.get("cust", {}).get("name") or info.get("name") or "app"
         out = os.path.join(sess["dir"], sanitize_filename(name) + ".apk")
         shutil.copyfile(apk, out)
+        final_pkg = _project_info(root).get("pkg") or sess.get("cust", {}).get("pkg") or info.get("pkg")
         cap = (f"✅ <b>{esc(name)}</b> - {'⚡ Optimized APK' if mode == 'opt' else 'APK'} taiyaar hai!\n"
-               f"📦 Package: <code>{esc(sess.get('cust', {}).get('pkg') or info.get('pkg'))}</code>\n"
+               f"📦 Package: <code>{esc(final_pkg)}</code>\n"
                f"💾 Size: {humanbytes(os.path.getsize(out))}\n"
                "Phone me install karke khol lo. (Debug build hai - Play Store ke liye release keystore lagega.)")
         try:
