@@ -29,6 +29,7 @@ from pyrogram.types import (
 import modules.video_engine as ve
 import modules.censor_engine as cen
 import modules.manga_downloader as mg
+import modules.app_builder as ab
 from modules.post_maker import (
     SENT_BY_BOT, POST_GAP, esc, is_bot_template, is_post_only_links, extract_urls, media_of,
     is_video_media, remember_sent, safe, post_message, album_post, template_reply,
@@ -57,7 +58,7 @@ HISTORY = {}
 LAST_LOCAL = {}
 
 COMMANDS = ["start", "help", "queue", "download", "compress", "censor",
-            "post", "cut", "template", "status", "ai", "cancel", "stop", "highlight", "preview", "find", "manga"]
+            "post", "cut", "template", "status", "ai", "cancel", "stop", "highlight", "preview", "find", "manga", "buildapp", "appbuilder", "app"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -714,6 +715,8 @@ async def router(client, message: Message):
     if is_bot_template(text):
         return
     try:
+        if await ab.try_build_input(client, message):
+            return
         if await mg.try_range_input(client, message):
             return
         if message.media_group_id:
@@ -867,6 +870,13 @@ async def manga_cmd(client, message: Message):
     await mg.manga_command(client, message)
 
 
+@app.on_message(_cmd("buildapp"))
+@app.on_message(_cmd("appbuilder"))
+@app.on_message(_cmd("app"))
+async def buildapp_cmd(client, message: Message):
+    await ab.buildapp_command(client, message)
+
+
 @app.on_message(_cmd("ai"))
 async def ai_cmd(client, message: Message):
     q = (message.text or "").split(maxsplit=1)
@@ -884,6 +894,8 @@ async def on_callback(client, cq: CallbackQuery):
         return await find_callback(client, cq, parts)
     if act == "mg":
         return await mg.manga_callback(client, cq, parts)
+    if act == "ab":
+        return await ab.app_callback(client, cq, parts)
     if act == "pz" and len(parts) >= 3 and parts[1] == "img":
         await cq.answer("🔞 Censor shuru…")
         try:
