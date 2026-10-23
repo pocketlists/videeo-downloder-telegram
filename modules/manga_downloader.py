@@ -15,8 +15,18 @@ import requests as _rq
 from modules.video_engine import UA, _proxy, make_headers, make_session, sanitize_filename, humanbytes, spawn
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp")
-BAD_TOKENS = ("logo", "avatar", "banner", "favicon", "placeholder", "spinner",
-              "loading-gif", "emoji", "/icons/", "ads-", "/ads/", "ad-", "blank.gif")
+BAD_RE = re.compile(
+    r"logo|avatar|banner|favicon|placeholder|spinner|loading-gif|emoji|/icons/|blank\.gif"
+    r"|(?<![a-z0-9])ads?(?:[-_/.]|$)"
+)
+_NUM = r"(\d+)(?:[.\-_](\d{1,2})(?!\d))?"
+_CH_PATTERNS = [re.compile(p, re.I) for p in (
+    r"chapter[-_/\s]*" + _NUM,
+    r"/ch[-_]" + _NUM + r"(?:[-_/]|$)",
+    r"episode[-_/\s]*" + _NUM,
+    r"\bch\.?\s*" + _NUM,
+)]
+RANGE_RE = re.compile(r"[\d\s,.\-–—]+|all", re.I)
 MAX_CHAPTERS_AT_ONCE = 100
 MAX_PAGES_PER_CHAPTER = 400
 TG_DOC_LIMIT = 48 * 1024 * 1024
@@ -73,22 +83,19 @@ def _fetch(url, cookies=None, timeout=30, post_data=None):
 
 
 def _num_str(num):
-    if float(num) == int(num):
-        return f"{int(num):03d}"
-    return f"{num:06.1f}".replace(".", "_")
+    n = float(num)
+    if n == int(n):
+        return f"{int(n):03d}"
+    frac = f"{n:.2f}".split(".")[1].rstrip("0")
+    return f"{int(n):03d}_{frac}"
 
 
 def _chapter_num(href, text):
     s = (href or "") + " " + (text or "")
-    for pat in (r"chapter[-_/\s]*(\d+(?:\.\d+)?)", r"/ch[-_](\d+(?:\.\d+)?)(?:[-_/]|$)",
-                r"episode[-_/\s]*(\d+(?:\.\d+)?)", r"\bch\.?\s*(\d+(?:\.\d+)?)\b",
-                r"chapter\s*(\d+(?:\.\d+)?)"):
-        m = re.search(pat, s, re.I)
+    for rx in _CH_PATTERNS:
+        m = rx.search(s)
         if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                pass
+            return float(f"{m.group(1)}.{m.group(2)}") if m.group(2) else float(m.group(1))
     return None
 
 
@@ -116,15 +123,16 @@ def _scan_chapters(txt, base):
 
 
 def _series_title(txt, url):
-    m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)', txt, re.I)
-    if not m:
-        m = re.search(r'<h1[^>]*>(.*?)</h1>', txt, re.I | re.S)
-    if not m:
-        m = re.search(r"<title>(.*?)</title>", txt, re.I | re.S)
-    t = ""
+    raw = ""
+    m = re.search(r'<meta[^>]+property=(["\'])og:title\1[^>]+content=(["\'])(.*?)\2', txt, re.I | re.S)
     if m:
-        t = re.sub(r"<[^>]+>", " ", ihtml.unescape(m.group(1)))
-        t = re.sub(r"\s+", " ", t).strip()
+        raw = m.group(3)
+    else:
+        m = re.search(r"<h1[^>]*>(.*?)</h1>", txt, re.I | re.S) or re.search(r"<title>(.*?)</title>", txt, re.I | re.S)
+        raw = m.group(1) if m else ""
+    t = ""
+    if raw:
+        t = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", ihtml.unescape(raw))).strip()
         for sep in (" - ", " | ", " – ", " — "):
             if sep in t and len(t.split(sep)[0]) >= 3:
                 t = t.split(sep)[0].strip()
@@ -170,7 +178,7 @@ def parse_series(url, cookies=None):
 
 def _img_ok(u):
     low = u.lower()
-    if any(t in low for t in BAD_TOKENS):
+    if BAD_RE.search(low):
         return False
     path = urlparse(u).path.lower()
     if path.endswith(".svg") or "/icon" in path:
@@ -368,7 +376,7 @@ def build_cbz(series_title, label, folder, out_path):
 
 
 def parse_range(text, chapters):
-    text = (text or "").strip().lower()
+    text = re.sub(r"\s*[-–—]\s*", "-", (text or "").strip().lower())
     if not text or text == "all":
         return list(chapters)
     by_num = {c["num"]: c for c in chapters}
@@ -417,7 +425,7 @@ async def _present_series(client, chat_id, url, st):
     try:
         series = await loop.run_in_executor(None, parse_series, url, None)
     except Exception as e:
-        await st.edit_text(f"❌ Parse fail: <code>{str(e)[:200]}</code>")
+        await st.edit_text(f"❌ Parse fail: <code>{ihtml.escape(str(e)[:200])}</code>")
         return False
     if not series["chapters"]:
         await st.edit_text(
@@ -425,11 +433,14 @@ async def _present_series(client, chat_id, url, st):
             "aur site par chapter list khuli honi chahiye."
         )
         return False
+    now = time.time()
+    for k in [k for k, j in JOBS.items() if now - j.get("ts", now) > 3600 and not j["busy"]]:
+        JOBS.pop(k, None)
     jid = _job_id(chat_id)
-    JOBS[jid] = {"series": series, "chat_id": chat_id, "busy": False, "msg": st}
+    JOBS[jid] = {"series": series, "chat_id": chat_id, "busy": False, "msg": st, "ts": now}
     chs = series["chapters"]
     await st.edit_text(
-        f"📚 <b>{series['title']}</b>\n\n"
+        f"📚 <b>{ihtml.escape(series['title'])}</b>\n\n"
         f"📖 Chapters: <b>{len(chs)}</b> (Ch {chs[0]['num']:g} → Ch {chs[-1]['num']:g})\n\n"
         "Kitne chapters download karun?",
         reply_markup=range_keyboard(jid),
@@ -542,6 +553,7 @@ async def manga_callback(client, cq, parts):
         sel = chs[:MAX_CHAPTERS_AT_ONCE]
     if job["busy"]:
         return await cq.answer("⏳ Download pehle se chal raha hai.", show_alert=True)
+    job["busy"] = True
     await cq.answer("⬇️ Download shuru…")
     job["msg"] = cq.message
     return spawn(run_manga_job(client, job, sel), job["chat_id"])
@@ -552,20 +564,21 @@ async def try_range_input(client, message):
     if not jid:
         return False
     text = (message.text or "").strip()
-    if not re.fullmatch(r"[\d\s,\.\-]+|all", text.lower()):
+    if not RANGE_RE.fullmatch(text):
         return False
     job = JOBS.get(jid)
     RANGE_WAIT.pop(message.chat.id, None)
     if not job:
         await message.reply_text("⌛ Session purana ho gaya, /manga dobara bhejo.")
         return True
-    sel = parse_range(text, job["series"]["chapters"])
+    sel = parse_range(text, job["series"]["chapters"])[:MAX_CHAPTERS_AT_ONCE]
     if not sel:
         await message.reply_text("❌ Is range me koi chapter nahi mila. Dobara try karo: /manga")
         return True
     if job["busy"]:
         await message.reply_text("⏳ Download pehle se chal raha hai.")
         return True
+    job["busy"] = True
     st = await message.reply_text("⬇️ Download shuru…")
     job["msg"] = st
     spawn(run_manga_job(client, job, sel), job["chat_id"])
@@ -577,61 +590,71 @@ async def run_manga_job(client, job, sel):
     job["busy"] = True
     msg = job["msg"]
     series = job["series"]
+    stitle = ihtml.escape(series["title"])
     loop = asyncio.get_running_loop()
     workdir = os.path.join(DOWNLOAD_DIR, f"manga_{int(time.time())}")
     os.makedirs(workdir, exist_ok=True)
     title = sanitize_filename(series["title"]) or "Manga"
     done, failed = [], []
     total_bytes = 0
+    sent = 0
+    last_edit = 0.0
     try:
         for i, ch in enumerate(sel, 1):
-            try:
-                await msg.edit_text(
-                    f"⬇️ <b>{series['title']}</b>\nChapter {ch['num']:g} download ho raha hai… ({i}/{len(sel)})"
-                )
-            except Exception:
-                pass
+            now = time.time()
+            if now - last_edit >= 3:
+                last_edit = now
+                try:
+                    await msg.edit_text(
+                        f"⬇️ <b>{stitle}</b>\nChapter {ch['num']:g} download ho raha hai… ({i}/{len(sel)})"
+                    )
+                except Exception:
+                    pass
             folder, pages, size, err = await loop.run_in_executor(
                 None, download_chapter, ch, workdir, None, None)
             if folder:
                 done.append((f"Chapter {_num_str(ch['num'])}", folder, ch))
                 total_bytes += size
             else:
-                failed.append(f"Ch {ch['num']:g} ({err})")
+                failed.append(f"Ch {ch['num']:g} ({ihtml.escape(str(err))})")
         if not done:
             return await msg.edit_text("❌ Ek bhi chapter download nahi hua.\n" + "\n".join(failed[:5]))
         rng = f"{sel[0]['num']:g}-{sel[-1]['num']:g}" if len(sel) > 1 else f"{sel[0]['num']:g}"
-        est = total_bytes
-        sent = []
-        if est <= TG_DOC_LIMIT or len(done) == 1 and est <= TG_DOC_LIMIT:
+        if total_bytes <= TG_DOC_LIMIT:
             out = os.path.join(workdir, f"{title}_Ch{rng}.zip")
             await loop.run_in_executor(None, build_zip, series["title"],
                                        [(l, f) for l, f, _c in done], out)
-            cap = (f"📚 <b>{series['title']}</b>\n📖 Chapters: <b>{rng}</b> ({len(done)})\n"
+            cap = (f"📚 <b>{stitle}</b>\n📖 Chapters: <b>{rng}</b> ({len(done)})\n"
                    f"🖼 Pages: <b>{sum(len(os.listdir(f)) for _l, f, _c in done)}</b>\n"
                    f"📦 Size: <code>{humanbytes(os.path.getsize(out))}</code>")
             await client.send_document(job["chat_id"], out, caption=cap)
-            sent.append(out)
+            sent = len(done)
         else:
-            await msg.edit_text("📦 ZIP bada hai — har chapter alag CBZ me bhej raha hoon…")
+            try:
+                await msg.edit_text("📦 ZIP bada hai — har chapter alag CBZ me bhej raha hoon…")
+            except Exception:
+                pass
             for label, folder, ch in done:
                 out = os.path.join(workdir, f"{title}_Ch{ch['num']:g}.cbz")
                 await loop.run_in_executor(None, build_cbz, series["title"], label, folder, out)
                 if os.path.getsize(out) > TG_DOC_LIMIT:
+                    failed.append(f"Ch {ch['num']:g} (size limit se bada)")
                     continue
                 await client.send_document(
                     job["chat_id"], out,
-                    caption=f"📚 {series['title']} — Chapter {ch['num']:g} ({len(os.listdir(folder))} pages)")
-                sent.append(out)
-        note = f"✅ <b>Ho gaya!</b> {len(done)} chapters bhej diye."
+                    caption=f"📚 {stitle} — Chapter {ch['num']:g} ({len(os.listdir(folder))} pages)")
+                sent += 1
+        note = f"✅ <b>Ho gaya!</b> {sent} chapters bhej diye."
         if failed:
             note += "\n⚠️ Fail: " + ", ".join(failed[:5])
         await msg.edit_text(note)
     except Exception as e:
         try:
-            await msg.edit_text(f"❌ Manga download fail: <code>{str(e)[:250]}</code>")
+            await msg.edit_text(f"❌ Manga download fail: <code>{ihtml.escape(str(e)[:250])}</code>")
         except Exception:
             pass
     finally:
         job["busy"] = False
+        for k in [k for k, v in JOBS.items() if v is job]:
+            JOBS.pop(k, None)
         shutil.rmtree(workdir, ignore_errors=True)
