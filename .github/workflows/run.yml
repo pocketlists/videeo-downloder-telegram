@@ -9,7 +9,8 @@ concurrency:
 
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
+    # ubuntu-latest = 26.04 (apt mirror slow + Cloudflare WARP repo unsupported) -> 24.04 pin
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
@@ -22,20 +23,59 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install System Dependencies
+      # apt ke 89 packages ki jagah static ffmpeg (~15 sec). Fail ho to apt fallback.
+      - name: Install FFmpeg (static)
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libglib2.0-0 libsm6 libxext6 libgomp1 libgl1 fonts-noto-color-emoji fonts-dejavu-core
+          set -e
+          mkdir -p "$HOME/bin"
+          if curl -fsSL --retry 3 --connect-timeout 15 -o /tmp/ff.tar.xz \
+              https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+              && tar -xf /tmp/ff.tar.xz -C /tmp; then
+            cp /tmp/ffmpeg-*/bin/ffmpeg /tmp/ffmpeg-*/bin/ffprobe "$HOME/bin/"
+            echo "$HOME/bin" >> "$GITHUB_PATH"
+          else
+            echo "Static ffmpeg fail - apt fallback"
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+
+      # Sirf jo libs missing hon wahi install (zyadatar runner par pehle se hoti hain)
+      - name: Install Missing System Libs
+        timeout-minutes: 5
+        run: |
+          MISSING=""
+          for p in libglib2.0-0t64 libsm6 libxext6 libgomp1 libgl1 fonts-noto-color-emoji fonts-dejavu-core; do
+            dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "Installing:$MISSING"
+            sudo apt-get update -qq -o Acquire::Retries=3
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 $MISSING
+          else
+            echo "All system libs already present."
+          fi
 
       - name: Install Python Packages
+        timeout-minutes: 15
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install --upgrade "yt-dlp[default,curl-cffi]"
 
+      - name: Cache Playwright Browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
       - name: Install Playwright Chromium
+        timeout-minutes: 10
         run: |
-          python -m playwright install chromium
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" != "true" ]; then
+            python -m playwright install chromium
+          fi
           python -m playwright install-deps chromium
 
       - name: Cache Censor Models
@@ -44,12 +84,24 @@ jobs:
           path: ~/.cache/huggingface
           key: censor-models-v1
 
+      # APK builds (/buildapp) ke liye Gradle libraries cache
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-v1
+          restore-keys: gradle-${{ runner.os }}-
+
       - name: Warm-up Censor Models
+        timeout-minutes: 10
         run: |
           python -c "import modules.censor_engine as c; c._load(); print('Censor backends:', c.censor_backends())"
 
       - name: Fallback Proxy (Cloudflare WARP)
         continue-on-error: true
+        timeout-minutes: 5
         env:
           SECRET_PROXY: ${{ secrets.FALLBACK_PROXY }}
         run: |
@@ -59,8 +111,10 @@ jobs:
           fi
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
+          # poora apt update nahi - sirf Cloudflare repo refresh (fast)
+          sudo apt-get update -o Dir::Etc::sourcelist="sources.list.d/cloudflare-client.list" \
+            -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
+          sudo apt-get install -y --no-install-recommends cloudflare-warp
           sudo systemctl enable --now warp-svc || true
           sleep 3
           warp-cli --accept-tos registration new || warp-cli --accept-tos register
