@@ -462,7 +462,7 @@ async def manga_command(client, message):
             "📚 <b>Manga / Manhwa Downloader</b>\n\nSeries ka link bhejo:\n"
             "<code>/manga https://site.com/manga/series-name</code>\n\n"
             "Ya bas series ka link hi bhej do — bot khud pehchan lega.\n"
-            "Phir chapters choose karke <b>ZIP</b> me organized images milengi.",
+            "Phir chapters choose karo, har chapter alag <b>ZIP</b> me milega.",
         )
     st = await message.reply_text("🔎 Series parse kar raha hoon…")
     su = series_url_from_chapter(url)
@@ -595,56 +595,37 @@ async def run_manga_job(client, job, sel):
     workdir = os.path.join(DOWNLOAD_DIR, f"manga_{int(time.time())}")
     os.makedirs(workdir, exist_ok=True)
     title = sanitize_filename(series["title"]) or "Manga"
-    done, failed = [], []
-    total_bytes = 0
+    failed = []
     sent = 0
-    last_edit = 0.0
     try:
         for i, ch in enumerate(sel, 1):
-            now = time.time()
-            if now - last_edit >= 3:
-                last_edit = now
-                try:
-                    await msg.edit_text(
-                        f"⬇️ <b>{stitle}</b>\nChapter {ch['num']:g} download ho raha hai… ({i}/{len(sel)})"
-                    )
-                except Exception:
-                    pass
-            folder, pages, size, err = await loop.run_in_executor(
-                None, download_chapter, ch, workdir, None, None)
-            if folder:
-                done.append((f"Chapter {_num_str(ch['num'])}", folder, ch))
-                total_bytes += size
-            else:
-                failed.append(f"Ch {ch['num']:g} ({ihtml.escape(str(err))})")
-        if not done:
-            return await msg.edit_text("❌ Ek bhi chapter download nahi hua.\n" + "\n".join(failed[:5]))
-        rng = f"{sel[0]['num']:g}-{sel[-1]['num']:g}" if len(sel) > 1 else f"{sel[0]['num']:g}"
-        if total_bytes <= TG_DOC_LIMIT:
-            out = os.path.join(workdir, f"{title}_Ch{rng}.zip")
-            await loop.run_in_executor(None, build_zip, series["title"],
-                                       [(l, f) for l, f, _c in done], out)
-            cap = (f"📚 <b>{stitle}</b>\n📖 Chapters: <b>{rng}</b> ({len(done)})\n"
-                   f"🖼 Pages: <b>{sum(len(os.listdir(f)) for _l, f, _c in done)}</b>\n"
-                   f"📦 Size: <code>{humanbytes(os.path.getsize(out))}</code>")
-            await client.send_document(job["chat_id"], out, caption=cap)
-            sent = len(done)
-        else:
             try:
-                await msg.edit_text("📦 ZIP bada hai — har chapter alag CBZ me bhej raha hoon…")
+                await msg.edit_text(f"⬇️ <b>{stitle}</b>\nChapter {ch['num']:g} ({i}/{len(sel)})")
             except Exception:
                 pass
-            for label, folder, ch in done:
-                out = os.path.join(workdir, f"{title}_Ch{ch['num']:g}.cbz")
-                await loop.run_in_executor(None, build_cbz, series["title"], label, folder, out)
-                if os.path.getsize(out) > TG_DOC_LIMIT:
-                    failed.append(f"Ch {ch['num']:g} (size limit se bada)")
-                    continue
-                await client.send_document(
-                    job["chat_id"], out,
-                    caption=f"📚 {stitle} — Chapter {ch['num']:g} ({len(os.listdir(folder))} pages)")
-                sent += 1
-        note = f"✅ <b>Ho gaya!</b> {sent} chapters bhej diye."
+            folder, pages, size, err = await loop.run_in_executor(
+                None, download_chapter, ch, workdir, None, None)
+            if not folder:
+                failed.append(f"Ch {ch['num']:g} ({ihtml.escape(str(err))})")
+                continue
+            out = os.path.join(workdir, f"{title}_Ch{ch['num']:g}.zip")
+            await loop.run_in_executor(None, build_cbz, series["title"], "", folder, out)
+            if os.path.getsize(out) > TG_DOC_LIMIT:
+                failed.append(f"Ch {ch['num']:g} (size limit se bada)")
+            else:
+                try:
+                    await client.send_document(
+                        job["chat_id"], out,
+                        caption=f"📚 {stitle} — Chapter {ch['num']:g} ({pages} pages)")
+                    sent += 1
+                except Exception as e:
+                    failed.append(f"Ch {ch['num']:g} ({ihtml.escape(str(e)[:60])})")
+            shutil.rmtree(folder, ignore_errors=True)
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+        note = f"✅ <b>Ho gaya!</b> {sent}/{len(sel)} chapters bhej diye."
         if failed:
             note += "\n⚠️ Fail: " + ", ".join(failed[:5])
         await msg.edit_text(note)
